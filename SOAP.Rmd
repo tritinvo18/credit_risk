@@ -1,138 +1,290 @@
 ---
-title: "Summary on a Page: Credit Risk Model Update"
-author: "Risk Analytics Team"
-date: "`r Sys.Date()`"
-output: pdf_document
+output: 
+  pdf_document:
+    latex_engine: pdflatex
+geometry: "top=0.38in,bottom=0.50in,left=0.55in,right=0.55in,footskip=0.20in"
+fontsize: 10pt
+header-includes:
+  - \usepackage{booktabs}
+  - \usepackage{colortbl}
+  - \usepackage{xcolor}
+  - \definecolor{midnightblue}{RGB}{25,25,112}
+  - \definecolor{darkred}{RGB}{139,0,0}
+  - \definecolor{forestgreen}{RGB}{34,139,34}
+  - \usepackage{enumitem}
+  - \usepackage{titlesec}
+  - \usepackage{microtype}
+  - \usepackage{fancyhdr}
+  - \pagestyle{fancy}
+  - \fancyhf{}
+  - \renewcommand{\headrulewidth}{0pt}
+  - \renewcommand{\footrulewidth}{0pt}
+  - \rfoot{\footnotesize\textcolor{gray}{Page \thepage\ of 2}}
+  - \titlespacing*{\section}{0pt}{3pt plus 1pt minus 1pt}{1.5pt plus 1pt minus 1pt}
+  - \titlespacing*{\subsection}{0pt}{2pt plus 1pt minus 1pt}{1pt plus 1pt minus 1pt}
+  - \setlist[itemize]{leftmargin=*,itemsep=1.2pt,topsep=1.2pt,partopsep=0pt,parsep=0pt}
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+knitr::opts_chunk$set(
+  echo = FALSE, 
+  warning = FALSE, 
+  message = FALSE, 
+  fig.align = "center",
+  dpi = 300
+)
 library(ggplot2)
 library(dplyr)
 library(lubridate)
-soap_data <- readRDS("soap_data.rds")
+library(patchwork)
+library(knitr)
+library(kableExtra)
+
+soap_data <- readRDS("assets/soap_data.rds")
 fit_glm <- soap_data$fit_glm
-time_ranef <- soap_data$time_ranef
 ```
 
-# Strategic Overview
-This memorandum outlines the redevelopment of our retail credit risk scoring framework. Our objective is to replace the institution's legacy classification approach with a transparent, highly accurate, and regulator-approved statistical framework. We developed a two-tiered approach. First, we built a foundational model to evaluate individual borrower risk based on application data. Second, we deployed an advanced structural model to explicitly measure how macro-economic events and geographical differences impact our portfolio. The result is a mathematically robust model that maximizes profitable approvals while tightly controlling default rates.
+```{=latex}
+\begin{center}
+\vspace{-10pt}
+{\LARGE\textbf{\textcolor{midnightblue}{SOAP: Credit Risk Model Redevelopment}}}\\[2pt]
+\textbf{Prepared By: Tri Tin Vo, Connor Shannon, Omid Nodeh, Nathan Burns} $\mid$ October 2026
+\end{center}
+\vspace{-8pt}
+\rule{\textwidth}{1pt}
+\vspace{-7pt}
+```
 
-# Operational Impact and Reliability
-By setting a strategic risk threshold of 15 percent, which aligns with our portfolio's historical base default rate, the institution can confidently approve `r round(soap_data$approval_rate * 100, 1)` percent of all new applications. Among those approved loans, we project an actual default rate of just `r round(soap_data$default_rate_of_approved * 100, 1)` percent, safely insulating the bank from financial losses.
+# Executive Decision and Performance Transformation
+The rebuilt logistic model materially improves applicant ranking over the supplied legacy benchmark. The legacy benchmark showed weak rank discrimination (validation Gini of **0.110**, AUC of **0.555**), which was insufficiently discriminating for the proposed banking use without redevelopment and validation. On common validation data, the rebuilt Generalized Linear Model (GLM) increased Gini by **+0.286 points** to **0.396**, while held-out testing supported similar performance on comparable historical applications, with Gini of **0.374** and AUC of **0.687**.
 
-The new model's ability to separate good borrowers from bad borrowers is objectively superior to the old system. On unseen testing data, the new model achieves a Gini score of `r round(soap_data$test_gini, 2)` (compared to an estimated 0.37 for the legacy system). A higher Gini score indicates that we are significantly more effective at ranking applicants from safest to riskiest, allowing us to issue more loans to safe borrowers with confidence.
+**Management Decision:** Retain the transparent GLM as the candidate applicant-ranking model, subject to redevelopment or recalibration on contemporary Australian data and independent validation. Reserve the spatial-temporal Generalized Linear Mixed Model (GLMM) for portfolio monitoring rather than live applicant scoring.
 
-We mathematically verified that credit risk is not uniform across the country or over time. Approximately `r round(soap_data$icc_state * 100, 2)` percent of the unexplained baseline risk in our portfolio is directly driven by the applicant's state of residence rather than their personal finances. This finding provides the evidence required for management to implement dynamic, regional concentration limits. Incorporating this geographic and temporal data generated a measurable performance gain over analyzing borrower finances alone.
+*Methods:* Binomial logistic regression, backward AIC selection, stratified 5-fold cross-validation, held-out validation and testing, ROC/Gini and calibration assessment, and a state-month random-intercept GLMM with forward temporal validation.
 
-# Key Drivers of Portfolio Risk
-To maintain absolute transparency with regulators, the chart below visualizes the most critical financial factors driving loan defaults. Values greater than zero indicate that an increase in the applicant's metric results in a higher likelihood of default. The horizontal bars represent our statistical confidence in these estimates. For example, as an applicant's interest rate or revolving utilization increases, their likelihood of defaulting rises sharply. Conversely, higher annual income significantly reduces risk.
-
-```{r plot1, fig.height=2.8, fig.width=8}
-target_vars <- c("int_rate", "annual_inc", "inq_last_6mths", "revol_util")
-coefs <- coef(fit_glm)[target_vars]
-cis <- confint(fit_glm)[target_vars, ]
-
-plot_data <- data.frame(
-  Variable = c("Interest Rate", "Annual Income", "Inquiries (6m)", "Revolving Util."),
-  Estimate = as.numeric(coefs),
-  Lower = as.numeric(cis[, 1]),
-  Upper = as.numeric(cis[, 2])
+```{r kpi_table}
+kpi_df <- data.frame(
+  `Performance Metric` = c(
+    "Validation Discrimination (Gini)",
+    "Held-Out Test Sample",
+    "Maximum Separation (KS)",
+    "Illustrative Policy Scenario (15% Cutoff)"
+  ),
+  `Legacy Benchmark` = c("0.110 (AUC = 0.555)", "Not available", "Not available", "Not applicable"),
+  `Rebuilt Model` = c("0.396 (AUC = 0.698)", "Gini 0.374; AUC 0.687", "KS = 0.280 (at 40.1% volume)", "60.6% approval volume"),
+  `Operational Takeaway` = c(
+    "+0.286 validation Gini points on common evaluation sample",
+    "95% CI: AUC [0.670, 0.703]; performance remained moderate on untouched historical test sample",
+    "Maximum separation between cumulative default and non-default score distributions at 40.1% volume",
+    "Approved default rate: 9.2% (vs 14.9% baseline); captures 62.5% of defaulting accounts"
+  ),
+  check.names = FALSE
 )
 
-ggplot(plot_data, aes(x = reorder(Variable, Estimate), y = Estimate, color = Estimate > 0)) +
-  geom_point(size = 3) +
-  geom_errorbar(aes(ymin = Lower, ymax = Upper), width = 0.2, linewidth = 1) +
-  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
-  coord_flip() +
-  scale_color_manual(values = c("darkblue", "darkred")) +
-  theme_minimal() +
+kable(kpi_df, booktabs = TRUE) |>
+  kable_styling(latex_options = c("hold_position", "striped"), font_size = 7.6) |>
+  column_spec(1, bold = TRUE, width = "3.8cm") |>
+  column_spec(2, width = "2.5cm") |>
+  column_spec(3, width = "3.5cm") |>
+  column_spec(4, width = "7.8cm")
+```
+
+# Primary Risk Drivers: Conditional Associations with Default Odds
+To support explainability, the scorecard estimates conditional Odds Ratios (OR) with 95% Wald confidence intervals. Factors above 1.0 are associated with higher conditional default odds; factors below 1.0 are associated with lower conditional default odds.
+
+```{r plot1, fig.height=1.65, fig.width=7.8, out.width="100%"}
+glm_summary <- summary(fit_glm)$coefficients
+ci_wald <- confint.default(fit_glm)
+
+plot_df <- data.frame(
+  Feature = c(
+    "Small Business Purpose",
+    "Employment: Unknown",
+    "Loan Term: 60 Months",
+    "Derogatory Public Record",
+    "Inquiries (Last 6 Months)",
+    "Interest Rate (+1.0%)",
+    "Revolving Balance (+$10k)",
+    "Revolving Util. (+10%)",
+    "Annual Income (+$10k)"
+  ),
+  OR = c(
+    exp(glm_summary["purposesmall_business", 1]),
+    exp(glm_summary["emp_lengthUnknown", 1]),
+    exp(glm_summary["term60 months", 1]),
+    exp(glm_summary["pub_rec", 1]),
+    exp(glm_summary["inq_last_6mths", 1]),
+    exp(glm_summary["int_rate", 1]),
+    exp(glm_summary["revol_bal", 1] * 10000),
+    exp(glm_summary["revol_util", 1] * 0.10),
+    exp(glm_summary["annual_inc", 1] * 10000)
+  ),
+  Lower = c(
+    exp(ci_wald["purposesmall_business", 1]),
+    exp(ci_wald["emp_lengthUnknown", 1]),
+    exp(ci_wald["term60 months", 1]),
+    exp(ci_wald["pub_rec", 1]),
+    exp(ci_wald["inq_last_6mths", 1]),
+    exp(ci_wald["int_rate", 1]),
+    exp(ci_wald["revol_bal", 1] * 10000),
+    exp(ci_wald["revol_util", 1] * 0.10),
+    exp(ci_wald["annual_inc", 1] * 10000)
+  ),
+  Upper = c(
+    exp(ci_wald["purposesmall_business", 2]),
+    exp(ci_wald["emp_lengthUnknown", 2]),
+    exp(ci_wald["term60 months", 2]),
+    exp(ci_wald["pub_rec", 2]),
+    exp(ci_wald["inq_last_6mths", 2]),
+    exp(ci_wald["int_rate", 2]),
+    exp(ci_wald["revol_bal", 2] * 10000),
+    exp(ci_wald["revol_util", 2] * 0.10),
+    exp(ci_wald["annual_inc", 2] * 10000)
+  ),
+  Impact = c(
+    "+176% odds",
+    "+73% odds",
+    "+56% odds",
+    "+28% odds / rec",
+    "+15% odds / inq",
+    "+12% odds / 1.0%",
+    "+4.6% odds / $10k",
+    "+4.3% odds / 10% pts",
+    "-6.6% odds / $10k"
+  ),
+  Type = c("High Risk", "High Risk", "Risk", "Risk", "Risk", "Risk", "Risk", "Risk", "Protective")
+)
+
+plot_df$Feature <- factor(plot_df$Feature, levels = rev(plot_df$Feature))
+
+ggplot(plot_df, aes(x = OR, y = Feature, color = Type)) +
+  annotate("rect", xmin = 0.75, xmax = 1.0, ymin = -Inf, ymax = Inf, fill = "honeydew", alpha = 0.6) +
+  annotate("rect", xmin = 1.0, xmax = 4.4, ymin = -Inf, ymax = Inf, fill = "mistyrose", alpha = 0.3) +
+  geom_vline(xintercept = 1.0, linetype = "dashed", color = "gray40", linewidth = 0.6) +
+  geom_errorbar(aes(xmin = Lower, xmax = Upper), orientation = "y", width = 0.25, linewidth = 0.75) +
+  geom_point(aes(size = Type)) +
+  geom_text(aes(x = Upper + 0.08, label = sprintf("OR: %.2f (%s)", OR, Impact)),
+            hjust = 0, size = 2.4, fontface = "bold", show.legend = FALSE) +
+  scale_color_manual(values = c("High Risk" = "firebrick3", "Risk" = "firebrick4", "Protective" = "forestgreen")) +
+  scale_size_manual(values = c("High Risk" = 2.8, "Risk" = 2.0, "Protective" = 2.8)) +
+  scale_x_continuous(limits = c(0.75, 4.4), breaks = c(0.8, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5)) +
   labs(
-    title = "Primary Drivers of Default Risk",
-    subtitle = "Financial characteristics holding independent predictive power",
-    x = "Applicant Metric",
-    y = "<< Decreases Default Risk             |             Increases Default Risk >>"
+    title = "Conditional Associations with Default Odds (GLM Estimates with 95% Wald Intervals)",
+    subtitle = "Multiplicative scale: values > 1.0 indicate elevated default odds; values < 1.0 indicate protective buffers",
+    x = "Odds Ratio (OR) Scale  [ < 1.0: Lower Estimated Odds  |  > 1.0: Default Odds Multiplier ]",
+    y = NULL
   ) +
+  theme_minimal(base_size = 8) +
   theme(
     legend.position = "none",
-    text = element_text(size = 11),
-    axis.title.x = element_text(face = "bold", color = "black", margin = margin(t = 10))
+    plot.title = element_text(face = "bold", size = 8.8, color = "midnightblue"),
+    plot.subtitle = element_text(size = 6.6, color = "gray30", margin = margin(b = 2)),
+    axis.text.y = element_text(face = "bold", size = 7.0, color = "black"),
+    axis.title.x = element_text(face = "bold", size = 6.6, color = "gray20", margin = margin(t = 2)),
+    panel.grid.minor = element_blank()
   )
 ```
 
-To address management's questions regarding geographic and macro-economic risk, we isolated the underlying default trends. As shown below, the baseline risk in our portfolio shifted drastically across states (left) and over time during the 2007-2011 Global Financial Crisis (right). This proves that severe economic environments and geographical footprints alter default rates entirely independent of applicant quality. Moving forward, management must actively monitor this macro-economic drift and regional concentration as we score modern applications.
+* **Largest Positive Associations:** Small-business loans carry $+175.7\%$ higher estimated conditional default odds ($\text{OR} = 2.76$, 95% CI: $[2.13, 3.56]$) relative to car loans. Applications with unreported employment tenure have $+72.9\%$ higher odds ($\text{OR} = 1.73$, $[1.37, 2.19]$), and 60-month terms carry $+56.4\%$ higher odds ($\text{OR} = 1.56$, $[1.43, 1.71]$). *Recommendation:* Review small-business-purpose applications under a dedicated policy assessment; treat missing employment tenure as a data-quality signal before operational use.
+* **Additional Risk Indicators:** Interest rate, inquiries, derogatory public records, revolving balance, and line utilization were all positively associated with default odds. Each additional derogatory public record was associated with $27.9\%$ higher estimated conditional default odds ($\text{OR} = 1.28$, $[1.12, 1.47]$).
+* **Lower Estimated Odds:** Higher annual income was consistently associated with lower conditional default odds: $\text{OR} = 0.934$ per additional $\$10,000$, 95% CI: $[0.923, 0.945]$.
+* **Expected-but-Dropped Account Depth Variables:** Total accounts (`total_acc`) and open accounts (`open_acc`) were not retained by backward AIC after adjustment for other candidate predictors, indicating limited incremental contribution under the selected specification. *Governance note:* Do not remove these fields operationally without local validation and assessment of their broader underwriting uses.
 
-```{r plot2, fig.height=4, fig.width=10}
-library(gridExtra)
-library(tidyr)
-state_ranef_df <- soap_data$state_ranef
+\newpage
 
-state_long <- gather(state_ranef_df, key = "Effect", value = "Estimate", -State)
-state_long$Effect <- ifelse(
-  state_long$Effect == "(Intercept)",
-  "Baseline State Risk",
-  "Interest Rate Penalty"
-)
+# Geographic and Vintage Dynamics: The "Ranking vs. Monitoring" Paradox
+State and month random effects improve portfolio description and vintage monitoring, but do not materially improve applicant ranking:
 
-ann_data <- state_long %>%
-  group_by(Effect) %>%
-  filter(Estimate == max(Estimate) | Estimate == min(Estimate))
+```{r plot2, fig.height=1.85, fig.width=7.8, out.width="100%"}
+state_df <- soap_data$state_ranef %>% arrange(Estimate) %>% mutate(Rank = row_number())
+sig_states <- state_df %>% filter(Significant == "Excludes Zero")
+low_state <- state_df %>% filter(Estimate == min(Estimate))
 
-state_plot <- ggplot(state_long, aes(x = reorder(State, Estimate), y = Estimate)) +
-  geom_point(color = "navy", size = 1) +
-  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
-  geom_point(data = ann_data, color = "red", size = 2) +
-  geom_text(
-    data = ann_data, aes(label = State),
-    vjust = -1, color = "red",
-    fontface = "bold", size = 3
-  ) +
-  facet_wrap(~Effect, scales = "free_x") +
-  coord_flip() +
+p2_state <- ggplot(state_df, aes(x = Estimate, y = Rank, color = Significant)) +
+  annotate("rect", xmin = -0.12, xmax = 0.12, ymin = -Inf, ymax = Inf, fill = "gray92", alpha = 0.5) +
+  annotate("text", x = 0.0, y = 14, label = "47 of 50 Jurisdictions\nOverlap Baseline", color = "gray45", size = 2.0, fontface = "italic") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray30") +
+  geom_errorbar(aes(xmin = Lower, xmax = Upper), orientation = "y", width = 0.25, linewidth = 0.35) +
+  geom_point(aes(size = Significant)) +
+  annotate("label", x = 0.44, y = 30,
+           label = "Only 3 States Exclude Zero:\n* NV: +0.43 (Highest deviation)\n* FL: +0.32\n* CA: +0.23\n(Exploratory signals)",
+           color = "firebrick4", fontface = "bold", size = 1.9, fill = "white") +
+  annotate("text", x = -0.22, y = 4, label = "CO (-0.19)", fontface = "bold", size = 2.0, color = "steelblue4") +
+  scale_color_manual(values = c("Excludes Zero" = "firebrick3", "Overlaps Zero" = "gray65")) +
+  scale_size_manual(values = c("Excludes Zero" = 1.8, "Overlaps Zero" = 0.7)) +
+  scale_x_continuous(limits = c(-0.55, 0.78), breaks = seq(-0.4, 0.6, 0.2)) +
+  scale_y_continuous(breaks = NULL) +
+  theme_minimal(base_size = 7.2) +
   labs(
-    title = "Geographical Risk Variance",
-    subtitle = "Best and worst states highlighted",
-    x = "", y = "Effect Estimate"
+    title = "State Baseline Deviations (GLMM)",
+    subtitle = "Approximate 95% conditional intervals; state variance is 0.88% of total variance",
+    y = "US States (Ranked by Risk)",
+    x = "Baseline Log-Odds Deviation (0 = Model-Wide Baseline)"
   ) +
-  theme_minimal() +
-  theme(axis.text.y = element_text(size = 5))
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold", size = 7.8, color = "midnightblue"),
+    plot.subtitle = element_text(size = 6.2, color = "gray30"),
+    axis.title.x = element_text(size = 6.6, face = "bold"),
+    axis.title.y = element_text(size = 6.6, face = "bold"),
+    plot.margin = margin(t = 2, r = 3, b = 2, l = 6, unit = "pt")
+  )
 
-time_plot <- ggplot(time_ranef, aes(x = Date, y = `(Intercept)`)) +
-  annotate(
-    "rect",
-    xmin = as.Date("2007-12-01"),
-    xmax = as.Date("2009-06-01"),
-    ymin = -Inf,
-    ymax = Inf,
-    alpha = 0.2, fill = "red"
-  ) +
-  annotate(
-    "text",
-    x = as.Date("2008-09-01"),
-    y = max(time_ranef$`(Intercept)`) * 0.9,
-    label = "GFC Peak Impact",
-    color = "darkred", fontface = "bold"
-  ) +
-  geom_line(color = "darkred", linewidth = 1, alpha = 0.4) +
-  geom_smooth(
-    method = "loess", se = FALSE,
-    color = "blue", linewidth = 1.2,
-    linetype = "dashed"
-  ) +
-  geom_point(color = "black") +
-  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
-  theme_minimal() +
+time_df <- soap_data$time_ranef
+p2_time <- ggplot(time_df, aes(x = Date, y = `(Intercept)`)) +
+  annotate("rect", xmin = as.Date("2007-12-01"), xmax = as.Date("2009-06-01"),
+           ymin = -Inf, ymax = Inf, fill = "mistyrose", alpha = 0.6) +
+  annotate("rect", xmin = as.Date("2011-01-01"), xmax = as.Date("2011-12-01"),
+           ymin = -Inf, ymax = Inf, fill = "#F2F6FA", alpha = 0.8) +
+  annotate("text", x = as.Date("2008-09-01"), y = 0.18,
+           label = "GFC Recession Period\n(NBER Dec 2007-Jun 2009)", color = "firebrick4", fontface = "bold", size = 2.0) +
+  geom_vline(xintercept = as.Date("2011-01-01"), linetype = "dotted", color = "#2C5F8A", linewidth = 0.45) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+  geom_line(color = "steelblue4", linewidth = 0.5, alpha = 0.5) +
+  geom_point(color = "steelblue4", size = 0.9) +
+  geom_smooth(method = "loess", se = FALSE, color = "navy", linewidth = 0.8) +
+  annotate("segment",
+           x = as.Date("2011-07-01"), y = -0.11,
+           xend = as.Date("2011-07-01"), yend = -0.01,
+           arrow = arrow(length = unit(0.08, "cm")),
+           linewidth = 0.35, colour = "#2C5F8A") +
+  annotate("label",
+           x = as.Date("2011-07-01"), y = -0.17,
+           label = "2011 prospective\nholdout",
+           size = 2.0, fontface = "bold",
+           fill = scales::alpha("white", 0.85),
+           colour = "#2C5F8A",
+           linewidth = 0.25) +
+  scale_y_continuous(limits = c(-0.25, 0.25)) +
+  theme_minimal(base_size = 7.2) +
   labs(
-    title = "Macro-Economic Drift (2007 - 2011)",
-    subtitle = "Dashed blue line tracks the smoothed underlying volatility",
-    x = "Origination Date", y = "Variation in Baseline Risk"
+    title = "Macroeconomic Drift & Vintage Trends",
+    subtitle = "Annual association: 14.0% lower conditional default odds per later origination year",
+    x = "Loan Origination Date (2007 - 2011)",
+    y = "Monthly Baseline Deviation"
   ) +
-  theme(text = element_text(size = 11))
+  theme(
+    plot.title = element_text(face = "bold", size = 7.8, color = "midnightblue"),
+    plot.subtitle = element_text(size = 6.2, color = "gray30"),
+    axis.title.x = element_text(size = 6.6, face = "bold"),
+    axis.title.y = element_text(size = 6.6, face = "bold"),
+    plot.margin = margin(t = 2, r = 2, b = 2, l = 2, unit = "pt")
+  )
 
-grid.arrange(state_plot, time_plot, ncol = 2)
+p2_state + p2_time + plot_layout(widths = c(1, 1.25))
 ```
 
-# Business Caveats and Forward-Looking Guidance
-While the framework is highly performant, responsible risk management requires acknowledging several realities. First, our automated algorithm actively excluded variables that management traditionally monitors, such as total active accounts. The model identified that these factors contain redundant information already captured by metrics like revolving utilization. By streamlining the scorecard, we reduce data-collection and processing costs without sacrificing accuracy.
+* **The "Ranking vs. Monitoring" Finding:** On the 2011 temporal holdout, adding the fitted state and time effects did not materially improve applicant rank discrimination: GLM Gini **0.4070** versus GLMM Gini **0.4069**. Borrower-level characteristics therefore provided essentially all of the rank-ordering performance achieved by the evaluated models on this holdout.
+* **Recommended Operational Role:** Advance the parsimonious GLM as the candidate applicant-ranking architecture for local redevelopment, recalibration, and independent validation. Use the GLMM for historical vintage monitoring, geographic portfolio decomposition, and identifying cohorts requiring investigation.
+* **Fair Lending & Governance Guardrails:** Nevada, Florida, and California had positive estimated baseline deviations with approximate conditional intervals excluding zero (state variance represents $0.88\%$ of latent variance). These exploratory historical associations do not establish causality. **Management must not implement regional rejection quotas or geographic risk pricing**, which could create material fairness, legal, and governance concerns.
+* **Temporal Trend Association:** Holding observed borrower characteristics constant, later origination years were associated with lower default odds ($\text{OR} = 0.860$, 95% CI: $[0.798, 0.927]$). Possible contributors include underwriting changes, borrower composition, outcome seasoning, and broader historical conditions.
 
-Furthermore, in states where we have very few historical loans, the model safely relies on the national average to predict risk. This mathematical safeguard prevents extreme policy reactions based on small sample sizes. Finally, our current 15 percent approval threshold is based on historical consistency. Future iterations of this framework should integrate exact loss given default and net margin data. Doing so will allow the institution to mathematically optimize the approval threshold for maximum portfolio profitability in dollar terms.
+# Diagnostic Findings, Governance Limitations & Deployment Roadmap
+To support model-governance review consistent with credit-risk management expectations, we evaluated model diagnostics and operational requirements:
+
+* **Diagnostic Findings:**
+  - *Global Checks:* Overall residual uniformity ($p = 0.811$) and dispersion ($p = 0.756$) tests were non-significant; adjusted GVIF values below 1.6 indicate no severe multicollinearity likely to destabilize fitted main-effect estimates.
+  - *Qualifications:* Grouped risk-band dispersion ($p = 0.020$) identified uneven variability across coarse predicted-risk groups, with mild underprediction in several intermediate-to-high risk bands; monthly aggregate residuals retained positive serial dependence ($DW = 0.984$, $p < 0.001$), indicating persistence between adjacent cohorts.
+* **Prudential Roadmap for Australian Banking Deployment:**
+  - *Representative Australian Data:* Before deployment, redevelop or recalibrate the model using representative Australian application, repayment, credit-bureau, affordability, and macroeconomic data, followed by independent validation and fairness assessment.
+  - *Complete Expected Credit Loss Framework:* The model provides Probability of Default (PD) only. Capital and expected-loss applications require validated PD, Loss Given Default (LGD), and Exposure at Default (EAD) components ($\text{ECL} = \text{PD} \times \text{LGD} \times \text{EAD}$) under approved governance.

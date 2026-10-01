@@ -1,15 +1,30 @@
 ---
-title: "Advanced Credit Risk Modeling: Technical Report"
-author: "Quantitative Risk Analytics Team"
-date: "`r Sys.Date()`"
+title: "Credit Risk Report"
+subtitle: "Benchmark Logistic Regression and Spatial-Temporal Mixed-Effects Analysis (Historical US P2P Lending, 2007-2011)"
+author: "Tri Tin Vo, Connor Shannon, Omid Nodeh, Nathan Burns"
+date: "1 October 2026"
 output: 
   pdf_document:
     toc: true
+    toc_depth: 3
     number_sections: true
+header-includes:
+  - \usepackage{caption}
+  - \captionsetup[table]{font=small,labelfont=bf,singlelinecheck=true}
+  - \captionsetup[figure]{font=small,labelfont=bf}
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+knitr::opts_chunk$set(
+  echo = FALSE, 
+  warning = FALSE, 
+  message = FALSE, 
+  fig.align = "center", 
+  fig.pos = "htbp", 
+  out.width = "95%", 
+  dpi = 300
+)
+Sys.setenv(OPENBLAS_NUM_THREADS = "1", OMP_NUM_THREADS = "1")
 library(dplyr)
 library(ggplot2)
 library(pROC)
@@ -22,308 +37,628 @@ library(arm)
 library(ROCR)
 library(ggeffects)
 library(DHARMa)
+library(knitr)
+library(kableExtra)
+library(patchwork)
+library(tidyr)
+
+# Set seed for reproducibility
+set.seed(42)
+
+# Source modular utilities
+source("scripts/utils.R")
+
+# Load pre-fitted models and DHARMa simulations (auto-generate if missing)
+if (!file.exists("assets/glmm_models.rds") || !file.exists("assets/dharma_results.rds")) {
+  source("scripts/fit_all_models.R")
+}
+glmm_models    <- readRDS("assets/glmm_models.rds")
+dharma_results <- readRDS("assets/dharma_results.rds")
 ```
 
-# Executive Context and Objective
-This technical report details the development, validation, and advanced extension of our retail credit risk scoring framework. Commissioned in response to strict regulatory scrutiny, our primary objective is to replace the institution's ad-hoc classification model with a verifiable, statistically rigorous framework capable of predicting loan default probabilities using only information available at the time of application. The analysis proceeds in two phases: first, establishing a robust benchmark Generalized Linear Model (GLM); and second, extending this framework using Mixed Effects (GLMM) to isolate idiosyncratic geographic and temporal risk from the underlying borrower characteristics.
+# Executive Summary
 
-# Phase 1: Benchmark GLM Development
+## Business Context
+Following the acquisition of our peer-to-peer (P2P) lending platform by a regional Australian bank, credit risk analytics are undergoing structural reform. Senior financial analysts at the acquiring bank evaluated the historical credit scoring engine using historical US personal lending data spanning 2007 to 2011. Their initial benchmarking revealed that the legacy model exhibited poor discriminatory power:
+$$\text{Train Gini} = 0.114 \quad (\text{AUC} = 0.557), \qquad \text{Validation Gini} = 0.110 \quad (\text{AUC} = 0.555)$$
+In an institutional banking framework governed by strict prudential standards—specifically APRA Prudential Standard APS 220 (*Credit Risk Management*) and Basel capital framework guidelines—the supplied benchmark showed weak discrimination ($\text{Gini} = 0.1100$) and would not, by itself, provide an adequate basis for a contemporary governed credit-risk model without further validation, controls, and redevelopment.
 
-## Data Ingestion and Preprocessing
-To ensure model stability, we first ingest the provided training, validation, and testing partitions. Redundant indices are removed, and missing data in critical fields—specifically employment length—are explicitly categorized as "Unknown" to prevent data loss while preserving the signal of missingness itself. We ensure that categorical levels are synchronized across all partitions to prevent out-of-sample prediction failures on unobserved classes.
+Management commissioned our team to execute a ground-up rebuild of the credit risk scoring system. The overarching operational objective is to construct a rigorous, transparent, and auditable statistical model to **predict retail loan default based exclusively on information available at the time of loan application**. 
 
-```{r eda_load}
+## Scope and Core Management Questions
+This technical report directly addresses five core management queries:
+
+1. **Question 1 (Benchmark & Operational Performance):** How does the newly developed model compare against the legacy benchmark on common data? What operational performance can be expected when underwriting future loan applications?
+2. **Question 2 (Variable Importance & Regulatory Interpretation):** What are the primary risk drivers in the developed model, and how do they compare with traditional banking covariates? How can all model parameters, odds ratios, and associated uncertainties be communicated transparently to support explainability and reason-code development?
+3. **Question 3 (Spatial-Temporal Predictive Gain):** Does incorporating regional (state-level) clustering and origination timing via Generalized Linear Mixed Models (GLMM) yield tangible out-of-sample performance improvements over borrower-level models?
+4. **Question 4 (Stability of Fundamental Risk Drivers):** Does controlling for macroeconomic drift and geographic variation alter the relative importance or magnitude of baseline borrower credit characteristics?
+5. **Question 5 (Jurisdictional and Temporal Dynamics):** How does baseline credit risk vary between jurisdictions and across origination vintages, and what does this imply for regional exposure limits and economic capital allocation?
+
+```{r exec_summary_table}
+exec_summary <- data.frame(
+  Dimension = c(
+    "Benchmark Discrimination",
+    "Model Selection & Link",
+    "Internal Stability (5-Fold CV)",
+    "Held-Out Generalization",
+    "Operational Policy Scenario (15% Cutoff)",
+    "Model Singularity & Parsimony",
+    "Spatial-Temporal Extension",
+    "Temporal Holdout Reality",
+    "Macroeconomic Drift"
+  ),
+  Finding = c(
+    "Legacy Valid Gini = 0.110; Rebuilt GLM Valid Gini = 0.396 (Delta Gini = +0.286 on common sample)",
+    "Backward AIC selected 9 predictors; Logit link chosen for odds-ratio transparency",
+    "Mean CV AUC = 0.7027 (SD: 0.0106), Mean Gini = 0.4053 (evaluated on fixed specification)",
+    "Test Gini = 0.3735 (AUC = 0.6868, 95% CI: [0.6705, 0.7030], Max KS = 0.280)",
+    "Illustrative cutoff: 60.6% approval rate; approved portfolio default rate reduced to 9.2%",
+    "The retained random-intercept GLMM is non-singular and passes global borrower-level uniformity and dispersion diagnostics. Grouped diagnostics identify elevated variability across coarse predicted-risk bands (ratio = 2.5520, p = 0.0200), while monthly residuals retain significant serial dependence (DW = 0.9844, p < 0.001)",
+    "Mixed effects yield small Gini gain under random split (0.3815 to 0.3897)",
+    "GLMM yields no Gini gain on 2011 holdout (GLM: 0.4070 vs. GLMM: 0.4069); REs aid monitoring, not ranking",
+    "Annual origination trend OR = 0.860, corresponding to 14% lower conditional default odds per later origination year; pattern may reflect underwriting changes, borrower composition, seasoning, or broader historical conditions"
+  )
+)
+kable(exec_summary, booktabs = TRUE, caption = "Executive summary: Model architecture and performance") |>
+  kable_styling(latex_options = "hold_position", font_size = 8) |>
+  column_spec(1, width = "4.2cm") |>
+  column_spec(2, width = "10.8cm")
+```
+
+\newpage
+
+# Benchmark GLM Development
+
+## Data Ingestion, Hygiene, and Data Dictionary Compliance
+To establish the baseline scoring model, we ingest the partitioned historical loan datasets: training ($N = 23,052$), validation ($N = 7,683$), and testing ($N = 7,684$). Consistent with sound model-governance expectations prohibiting target leakage, we exclude post-origination servicing variables (such as subsequent payment amounts or recoveries) and retain strictly pre-decision application fields.
+
+```{r data_ingest}
 train <- read.csv("data/benchmark_training_loan_data.csv")
 valid <- read.csv("data/benchmark_validation_loan_data.csv")
-test <- read.csv("data/benchmark_testing_loan_data.csv")
+test  <- read.csv("data/benchmark_testing_loan_data.csv")
 
-clean_data <- function(df) {
-  if ("Unnamed..0" %in% names(df)) df$Unnamed..0 <- NULL
-  if ("X" %in% names(df)) df$X <- NULL
-  df$emp_length[is.na(df$emp_length) | df$emp_length == "n/a"] <- "Unknown"
-  cat_vars <- c("term",
-  "home_ownership", "verification_status", "purpose", "emp_length")
-  for (v in cat_vars) df[[v]] <- as.factor(df[[v]])
-  return(df)
-}
+train <- clean_benchmark(train)
+valid <- clean_benchmark(valid)
+test  <- clean_benchmark(test)
 
-train <- clean_data(train)
-valid <- clean_data(valid)
-test <- clean_data(test)
+nominal_cols <- c("term", "home_ownership", "verification_status", "purpose", "emp_length")
 
-cat_vars <- c("term",
-  "home_ownership", "verification_status", "purpose", "emp_length")
-for (v in cat_vars) {
-  valid <- valid[valid[[v]] %in% levels(train[[v]]), ]
-  test <- test[test[[v]] %in% levels(train[[v]]), ]
-}
+valid <- align_factor_levels(valid, train, nominal_cols)
+test  <- align_factor_levels(test, train, nominal_cols)
+stopifnot(nrow(valid) == 7683, nrow(test) == 7684)
 ```
 
-Prior to model fitting, we must verify that our predictors do not suffer from severe multicollinearity, which would artificially inflate standard errors and destabilize coefficient estimates.
+### Treatment of Missingness and Financial Distributions
+**Employment Length (`emp_length`):** Missing values (~2.5% of records) are encoded into an explicit category `"Unknown"`. Missing employment tenure may contain predictive information arising from applicant, collection, or processing differences. Because the source of missingness is unavailable in this observational dataset, it was modelled as an explicit category rather than assigned a substantive behavioral mechanism. Rather than executing listwise deletion (which induces sample selection bias and degrades sample power), treating missingness as a discrete level allows the model to estimate its conditional association.
+**Predictor Distributions:** Continuous financial metrics display expected credit characteristics. Revolving utilization (`revol_util`) ranges from 0.00 to 1.19 with a median of 0.499. Gross annual income (`annual_inc`) and revolving balance (`revol_bal`) exhibit severe positive skewness. While logarithmic transformations represent a standard statistical remedy, linear specifications were initially fitted to preserve direct marginal interpretability, followed by formal sensitivity comparisons.
 
-```{r eda_missing_cor}
-prelim_glm <- glm(repay_fail ~ ., data = train, family = binomial)
-print(vif(prelim_glm))
+## Multicollinearity Diagnostics (GVIF)
+Collinearity among financial ratios can inflate coefficient standard errors and produce unstable sign reversals. Because the predictor matrix includes multi-category factors, we assess Generalized Variance Inflation Factors (GVIF). For factors with $Df > 1$, collinearity is evaluated using the adjusted metric $GVIF^{1 / (2 \times Df)}$.
+
+```{r multicollinearity}
+prelim_glm <- glm(repay_fail ~ ., data = train, family = binomial(link = "logit"))
+gvif_res <- vif(prelim_glm)
+
+gvif_df <- data.frame(
+  Predictor = rownames(gvif_res),
+  GVIF = round(gvif_res[, "GVIF"], 3),
+  Df = gvif_res[, "Df"],
+  `Adjusted GVIF` = round(gvif_res[, "GVIF^(1/(2*Df))"], 3),
+  check.names = FALSE,
+  row.names = NULL
+)
+kable(head(gvif_df, 10), booktabs = TRUE, caption = "Generalized variance inflation factors (GVIF)") |>
+  kable_styling(latex_options = "hold_position", font_size = 8.5)
 ```
 
-The Generalized Variance Inflation Factors (GVIF) for all predictors remain strictly below the critical thresholds. We can confidently conclude that the feature set is statistically independent enough for interpretable, stable regression analysis.
+All adjusted GVIF values were below 1.5. Under common screening conventions, these values do not indicate severe multicollinearity likely to destabilise the fitted main-effect estimates.
 
-## Algorithmic Variable Selection and Link Function Justification
-In a regulated banking environment, every variable included in a scorecard must be explicitly justified. Rather than relying solely on management tradition or manual exclusion, we employ automated backward stepwise selection optimizing for the Akaike Information Criterion (AIC). This approach systematically trims variables that do not provide independent predictive power, penalizing unnecessary complexity.
+## Algorithmic Variable Selection and Model Parsimony
+To construct a parsimonious and readily reviewable model, backward AIC selection was applied. Stepwise AIC systematically removes terms whose marginal explanatory contribution fails to compensate for the penalty imposed on model complexity ($2k$).
 
-```{r var_selection, results='hide'}
+```{r stepwise_selection, results='hide'}
 step_glm <- step(prelim_glm, direction = "backward", trace = 0)
 ```
 
-```{r var_dropped}
-dropped_vars <- setdiff(names(coef(prelim_glm)), names(coef(step_glm)))
-print(dropped_vars)
+```{r selection_inspection}
+retained_terms <- attr(terms(step_glm), "term.labels")
+all_terms <- attr(terms(prelim_glm), "term.labels")
+dropped_terms <- setdiff(all_terms, retained_terms)
+
+drop_summary <- data.frame(
+  Predictor = dropped_terms,
+  `Incremental AIC Fit / Operational Rationale` = c(
+    "Loan amount offered limited incremental AIC improvement after adjusting for balance, income, and term",
+    "Home equity proxy did not sufficiently improve model fit after controlling for applicant leverage",
+    "Verification flag provided insufficient independent penalty-adjusted explanatory power",
+    "Debt-to-income ratio did not improve AIC over direct income and revolving balance metrics",
+    "Historical delinquencies offered limited incremental signal compared to active credit utilization",
+    "Raw open credit line count did not provide sufficient incremental explanatory power after controlling for utilization and inquiries",
+    "Total account depth offered limited incremental explanatory power beyond active utilization and inquiries",
+    "Credit bureau tenure provided marginal predictive gain over active utilization metrics"
+  ),
+  check.names = FALSE
+)
+kable(drop_summary, booktabs = TRUE, caption = "Predictors removed by backward AIC") |>
+  kable_styling(latex_options = "hold_position", font_size = 8) |>
+  column_spec(1, width = "2.8cm") |>
+  column_spec(2, width = "12.2cm")
 ```
 
-The stepwise procedure systematically eliminated the variables listed above due to overlapping signal. While variables such as total active accounts may traditionally carry weight in expert-judgment scorecards, the algorithm correctly identified that their predictive value is already adequately captured by more robust metrics like revolving utilization. We must note, however, that because this selection was performed on the training set, the resulting confidence intervals are subject to post-selection inference bias and should be interpreted as mathematically approximate.
+The backward elimination procedure retained nine predictor terms (represented by 32 fitted coefficients including categorical contrasts): `term`, `int_rate`, `emp_length`, `annual_inc`, `purpose`, `inq_last_6mths`, `pub_rec`, `revol_bal`, and `revol_util`. Total and open account counts were removed because they did not provide sufficient incremental fit under the AIC criterion after adjustment for the retained predictors. Their information may partially overlap with inquiry and utilization measures, although the GVIF results do not indicate severe multicollinearity.
 
-With the optimal feature set identified, we must select the appropriate binomial link function. We fit Logistic (logit), Probit, and Complementary Log-Log (cloglog) models, evaluating them on both AIC and out-of-sample Gini coefficient using the validation set.
+*Statistical Caveat on Post-Selection Inference:* Because variable selection was conducted on the training sample, nominal $p$-values and standard confidence intervals derived from the final model are conditional on the selected specification and may understate total model-selection uncertainty. Evaluation on held-out validation and testing partitions provides a less optimistic estimate of performance on comparable historical applications.
 
-```{r link_selection}
+## Internal Model Stability: 5-Fold Stratified Cross-Validation
+Consistent with sound validation practice prior to evaluating held-out partitions, we execute 5-fold stratified cross-validation on the training dataset. Stratification preserves the empirical 14.9% default prevalence across all folds.
+
+```{r cross_validation}
 formula_sel <- formula(step_glm)
-fit_logit <- glm(formula_sel, data = train, family = binomial(link = "logit"))
-fit_probit <- glm(formula_sel, data = train, family = binomial(link = "probit"))
-fit_cloglog <- glm(formula_sel, data = train, family = binomial(link = "cloglog"))
+set.seed(42)
+folds <- createFolds(train$repay_fail, k = 5, list = TRUE)
+cv_metrics <- data.frame(Fold = 1:5, AUC = numeric(5), Gini = numeric(5), Brier = numeric(5))
 
-get_gini <- function(model, newdata) {
-  p <- predict(model, newdata, type = "response")
-  2 * as.numeric(auc(roc(newdata$repay_fail, p, quiet = TRUE))) - 1
+for (i in 1:5) {
+  cv_tr <- train[-folds[[i]], ]
+  cv_te <- train[folds[[i]], ]
+  
+  fit_fold <- glm(formula_sel, data = cv_tr, family = binomial(link = "logit"))
+  pred_fold <- predict(fit_fold, newdata = cv_te, type = "response")
+  
+  roc_fold <- roc(cv_te$repay_fail, pred_fold, quiet = TRUE)
+  cv_metrics$AUC[i]   <- as.numeric(auc(roc_fold))
+  cv_metrics$Gini[i]  <- 2 * cv_metrics$AUC[i] - 1
+  cv_metrics$Brier[i] <- mean((pred_fold - cv_te$repay_fail)^2)
 }
 
-cat(
-  "Logit   - AIC:", AIC(fit_logit),
-  " | Valid Gini:", get_gini(fit_logit, valid), "\n"
+cv_summary <- data.frame(
+  Metric = c("Area Under ROC (AUC)", "Gini Coefficient", "Brier Score (Calibration Loss)"),
+  `5-Fold CV Mean` = c(mean(cv_metrics$AUC), mean(cv_metrics$Gini), mean(cv_metrics$Brier)),
+  `5-Fold CV Std Dev` = c(sd(cv_metrics$AUC), sd(cv_metrics$Gini), sd(cv_metrics$Brier)),
+  check.names = FALSE
 )
-cat(
-  "Probit  - AIC:", AIC(fit_probit),
-  " | Valid Gini:", get_gini(fit_probit, valid), "\n"
-)
-cat(
-  "Cloglog - AIC:", AIC(fit_cloglog),
-  " | Valid Gini:", get_gini(fit_cloglog, valid), "\n"
-)
+kable(cv_summary, digits = 4, booktabs = TRUE, caption = "Stratified 5-fold cross-validation performance") |>
+  kable_styling(latex_options = "hold_position", font_size = 8.5)
 ```
 
-The Logistic model provides an optimal balance of predictive power and interpretability. While the Probit link yields a virtually identical information criterion and Gini, the logit link translates directly into odds ratios. This complete transparency is paramount for regulatory compliance, and thus we proceed with the Logistic GLM.
+The modest variation across folds (Mean AUC = $0.7027$, $\text{SD} = 0.0106$; Mean Gini = $0.4053$, $\text{SD} = 0.0212$) suggests that the discrimination and Brier score of the fixed selected specification are reasonably stable within the training population. Because feature selection preceded cross-validation, these estimates do not incorporate model-selection uncertainty; independent validation and testing provide less optimistic estimates of performance under the chosen specification, with the untouched testing partition providing the final held-out estimate. However, they do not resolve conditional post-selection uncertainty for the individual parameter estimates.
 
-## Final Benchmark Model and Diagnostics
-The finalized logistic regression yields the following structural parameters, defining our new institutional benchmark.
+## Link Function Selection
+We evaluate three candidate binomial link functions—Logit, Probit, and Complementary Log-Log (Cloglog)—fitted to the selected feature space. Models are compared on Training AIC and out-of-sample discriminatory power (Gini) on the independent validation partition ($N = 7,683$).
 
-```{r final_glm_summary}
-summary(fit_logit)
+```{r link_comparison}
+fit_logit   <- glmm_models$fit_logit
+fit_probit  <- glmm_models$fit_probit
+fit_cloglog <- glmm_models$fit_cloglog
+
+link_comp <- data.frame(
+  `Link Function` = c("Logit (Canonical)", "Probit", "Complementary Log-Log (Cloglog)"),
+  `Functional Form` = c("ln(p/(1-p))", "Phi^{-1}(p)", "ln(-ln(1-p))"),
+  `Training AIC` = c(AIC(fit_logit), AIC(fit_probit), AIC(fit_cloglog)),
+  `Validation Gini` = c(calc_gini(fit_logit, valid), calc_gini(fit_probit, valid), calc_gini(fit_cloglog, valid)),
+  check.names = FALSE
+)
+kable(link_comp, digits = 4, booktabs = TRUE, caption = "Link function out-of-sample comparison") |>
+  kable_styling(latex_options = "hold_position", font_size = 8.5)
 ```
 
-To translate these coefficients into actionable business insight, we isolate and visualize the impact of the most critical continuous variables on the log-odds of default.
+The three link functions yield practically indistinguishable discrimination (Validation Gini $\approx 0.395 - 0.396$). The Logit model is formally adopted because it achieves marginally higher validation discrimination ($0.3964$) and, critically, maps estimated parameters directly to multiplicative Odds Ratios ($\text{OR} = e^\beta$). This supports model transparency by providing interpretable conditional odds ratios essential for explainability and reason-code development, although model coefficients alone do not constitute applicant-level reason codes.
 
-```{r coef_plot, fig.height=4, fig.width=7}
-target_vars <- c("int_rate", "annual_inc", "inq_last_6mths", "revol_util")
-coefs <- coef(fit_logit)[target_vars]
-cis <- confint(fit_logit)[target_vars, ]
+## Interpretation of Primary Retained Covariates with Uncertainty
+To support transparent model governance and address Management Question 2, Table 6 presents the primary retained risk drivers, standard errors, Wald $z$-statistics, Odds Ratios, and 95% Wald confidence intervals. Reference levels are explicitly stated (the complete parameter table with all factor levels is provided in Appendix B).
 
-plot_data <- data.frame(
-  Variable = c("Interest Rate", "Annual Income", "Inquiries (6m)", "Revolving Util."),
-  Estimate = as.numeric(coefs),
-  Lower = as.numeric(cis[, 1]),
-  Upper = as.numeric(cis[, 2])
+```{r covariate_table}
+glm_summary <- summary(fit_logit)$coefficients
+ci_wald <- confint.default(fit_logit)
+
+core_terms <- c(
+  "Intercept (Baseline)", "Loan term: 60 months", "Interest rate", "Employment tenure: Unknown", 
+  "Annual income ($10k)", "Small business purpose", "Credit card purpose", "Debt consolidation purpose",
+  "Credit inquiries (6m)", "Derogatory public records", "Revolving balance ($10k)", "Revolving utilization (10%)"
 )
 
-ggplot(plot_data, aes(x = reorder(Variable, Estimate),
-    y = Estimate, color = Estimate > 0)) +
-  geom_point(size = 3) +
-  geom_errorbar(aes(ymin = Lower, ymax = Upper), width = 0.2, linewidth = 1) +
-  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
-  coord_flip() +
-  scale_color_manual(values = c("darkblue", "darkred")) +
-  theme_minimal() +
-  labs(
-    title = "Impact of Key Continuous Variables on Default Risk",
-    subtitle = "Financial characteristics holding independent predictive power",
-    x = "Applicant Metric",
-    y = "<< Decreases Default Risk             |             Increases Default Risk >>"
-  ) +
-  theme(
-    legend.position = "none",
-    text = element_text(size = 11),
-    axis.title.x = element_text(face = "bold", color = "black", margin = margin(t = 10))
+coef_table <- data.frame(
+  Predictor = core_terms,
+  `Reference / Unit` = c(
+    "Baseline constant", "vs. 36 months", "Per 1% interest rate", "vs. < 1 year tenure",
+    "Per $10,000 income", "vs. car purpose", "vs. car purpose", "vs. car purpose",
+    "Per inquiry count", "Per record count", "Per $10,000 balance", "Per 10% utilization (0.10)"
+  ),
+  Estimate = c(
+    glm_summary["(Intercept)", 1], glm_summary["term60 months", 1], glm_summary["int_rate", 1],
+    glm_summary["emp_lengthUnknown", 1], glm_summary["annual_inc", 1] * 10000,
+    glm_summary["purposesmall_business", 1], glm_summary["purposecredit_card", 1],
+    glm_summary["purposedebt_consolidation", 1], glm_summary["inq_last_6mths", 1],
+    glm_summary["pub_rec", 1], glm_summary["revol_bal", 1] * 10000, glm_summary["revol_util", 1] * 0.10
+  ),
+  `Odds Ratio` = c(
+    exp(glm_summary["(Intercept)", 1]), exp(glm_summary["term60 months", 1]), exp(glm_summary["int_rate", 1]),
+    exp(glm_summary["emp_lengthUnknown", 1]), exp(glm_summary["annual_inc", 1] * 10000),
+    exp(glm_summary["purposesmall_business", 1]), exp(glm_summary["purposecredit_card", 1]),
+    exp(glm_summary["purposedebt_consolidation", 1]), exp(glm_summary["inq_last_6mths", 1]),
+    exp(glm_summary["pub_rec", 1]), exp(glm_summary["revol_bal", 1] * 10000), exp(glm_summary["revol_util", 1] * 0.10)
+  ),
+  `Lower 95% CI` = c(
+    exp(ci_wald["(Intercept)", 1]), exp(ci_wald["term60 months", 1]), exp(ci_wald["int_rate", 1]),
+    exp(ci_wald["emp_lengthUnknown", 1]), exp(ci_wald["annual_inc", 1] * 10000),
+    exp(ci_wald["purposesmall_business", 1]), exp(ci_wald["purposecredit_card", 1]),
+    exp(ci_wald["purposedebt_consolidation", 1]), exp(ci_wald["inq_last_6mths", 1]),
+    exp(ci_wald["pub_rec", 1]), exp(ci_wald["revol_bal", 1] * 10000), exp(ci_wald["revol_util", 1] * 0.10)
+  ),
+  `Upper 95% CI` = c(
+    exp(ci_wald["(Intercept)", 2]), exp(ci_wald["term60 months", 2]), exp(ci_wald["int_rate", 2]),
+    exp(ci_wald["emp_lengthUnknown", 2]), exp(ci_wald["annual_inc", 2] * 10000),
+    exp(ci_wald["purposesmall_business", 2]), exp(ci_wald["purposecredit_card", 2]),
+    exp(ci_wald["purposedebt_consolidation", 2]), exp(ci_wald["inq_last_6mths", 2]),
+    exp(ci_wald["pub_rec", 2]), exp(ci_wald["revol_bal", 2] * 10000), exp(ci_wald["revol_util", 2] * 0.10)
+  ),
+  `p-value` = c(
+    "< 0.001", "< 0.001", "< 0.001", "< 0.001", "< 0.001",
+    "< 0.001", sprintf("%.3f", glm_summary["purposecredit_card", 4]),
+    sprintf("%.3f", glm_summary["purposedebt_consolidation", 4]),
+    "< 0.001", "< 0.001", "< 0.001", "< 0.001"
+  ),
+  check.names = FALSE,
+  row.names = NULL
+)
+names(coef_table) <- c("Predictor", "Reference / Unit", "Estimate", "OR", "95% Wald CI Lower", "95% Wald CI Upper", "p-value")
+kable(coef_table, digits = 3, booktabs = TRUE, caption = "Primary GLM odds ratios and 95% Wald confidence intervals") |>
+  kable_styling(latex_options = "hold_position", font_size = 8) |>
+  column_spec(1, width = "2.9cm") |>
+  column_spec(2, width = "2.9cm") |>
+  column_spec(3:7, width = "1.5cm")
+```
+
+### Interpretation of Key Risk Drivers in the Final Model
+* **Loan Term (`term`):** The reference level is 36 months. Borrowers taking a 60-month loan exhibit an Odds Ratio of $1.564$ (95% CI: $[1.429, 1.713]$, $p < 0.001$). Holding other financial characteristics constant, extending loan maturity to 5 years is associated with approximately $56.4\%$ higher estimated default odds; longer maturity may proxy exposure duration, borrower selection, or unmeasured affordability differences, but the observational model does not isolate the mechanism.
+* **Interest Rate (`int_rate`):** Each 1.0 percentage point increase in interest rate is associated with an $11.7\%$ increase in default odds ($\text{OR} = 1.117$, 95% CI: $[1.102, 1.132]$, $p < 0.001$). Evaluated over a 5.0 percentage point increment, default odds increase by approximately $73.7\%$ ($\text{OR}_{5pp} = \exp(5 \times 0.1104) \approx 1.737$, 95% CI: $[1.624, 1.856]$). Interest rate is associated with default risk, although it may partly reflect lender risk-based pricing and borrower risk rather than a purely causal payment-burden effect.
+* **Employment Length (`emp_length`):** The reference category is `< 1 year`. Most reported tenure brackets (1 to 10+ years) show modest, non-significant deviations from baseline. However, the `"Unknown"` category displays an Odds Ratio of $1.729$ (95% CI: $[1.368, 2.185]$, $p < 0.001$). Unreported employment tenure is associated with a $72.9\%$ increase in conditional default odds; retaining an explicit unknown category preserved observations and identified a distinct conditional association, though it does not establish why employment tenure was unrecorded.
+* **Annual Income (`annual_inc`):** Income provides a protective effect ($\beta = -0.0683$ per $\$10,000$, $p < 0.001$). Each additional $\$10,000$ in annual gross income is associated with approximately $6.6\%$ lower estimated default odds ($\text{OR}_{10k} = 0.934$, 95% CI: $[0.923, 0.945]$).
+* **Loan Purpose (`purpose`):** The reference category is `car` (automotive loans). Consumer refinancing categories such as `credit_card` ($\text{OR} = 0.935$, 95% CI: $[0.732, 1.194]$, $p = 0.589$) and `debt_consolidation` ($\text{OR} = 1.225$, 95% CI: $[0.982, 1.528]$, $p = 0.072$) do not differ significantly from auto loans. However, `small_business` loans display substantially higher estimated conditional default odds: $\text{OR} = 2.757$ (95% CI: $[2.134, 3.562]$, $p < 0.001$), carrying $175.7\%$ higher estimated default odds than car purchasers.
+* **Credit Inquiries in Past 6 Months (`inq_last_6mths`):** Each additional credit inquiry is associated with $15.3\%$ higher default odds ($\text{OR} = 1.153$, 95% CI: $[1.127, 1.179]$, $p < 0.001$).
+* **Derogatory Public Records (`pub_rec`):** Each additional derogatory public record is associated with $27.9\%$ higher default odds ($\text{OR} = 1.279$, 95% CI: $[1.117, 1.466]$, $p < 0.001$).
+* **Revolving Balance (`revol_bal`):** Each additional $\$10,000$ in outstanding revolving credit is associated with approximately $4.6\%$ higher default odds ($\text{OR}_{10k} = 1.046$, 95% CI: $[1.026, 1.065]$, $p < 0.001$).
+* **Revolving Line Utilization (`revol_util`):** In the dataset, utilization is recorded as a proportion (0.0 to 1.19). With $\beta = 0.4188$, a 10 percentage point increase ($\Delta = 0.10$) is associated with approximately $4.3\%$ higher default odds ($\text{OR}_{10pp} = \exp(0.4188 \times 0.10) \approx 1.043$, 95% CI: $[1.027, 1.059]$).
+
+## Sensitivity Analysis: Functional Form and Linearity
+To evaluate whether the linear-in-the-logit assumption introduces material misspecification, we fit an alternative model replacing raw income and revolving balance with logarithmic transformations: `log1p(annual_inc)` and `log1p(revol_bal)`.
+
+```{r nonlinear_sensitivity}
+form_nonlin <- repay_fail ~ term + int_rate + emp_length + log1p(annual_inc) + purpose + 
+    inq_last_6mths + pub_rec + log1p(revol_bal) + revol_util
+fit_nonlin <- glmm_models$fit_nonlin
+
+p_val_lin <- predict(fit_logit, newdata = valid, type = "response")
+p_val_non <- predict(fit_nonlin, newdata = valid, type = "response")
+
+nonlin_comp <- data.frame(
+  Specification = c("Selected Linear GLM", "Nonlinear GLM (log1p income & balance)"),
+  Df = c(fit_logit$df.null - fit_logit$df.residual, fit_nonlin$df.null - fit_nonlin$df.residual),
+  `Training AIC` = c(AIC(fit_logit), AIC(fit_nonlin)),
+  `Validation AUC` = c(as.numeric(auc(roc(valid$repay_fail, p_val_lin, quiet = TRUE))),
+                       as.numeric(auc(roc(valid$repay_fail, p_val_non, quiet = TRUE)))),
+  `Validation Gini` = c(calc_gini(fit_logit, valid), calc_gini(fit_nonlin, valid)),
+  check.names = FALSE
+)
+kable(nonlin_comp, digits = 4, booktabs = TRUE, caption = "Linear vs. nonlinear specification sensitivity") |>
+  kable_styling(latex_options = "hold_position", font_size = 8.5)
+```
+
+Log transformations materially improved training-sample likelihood fit, reducing AIC by approximately 40 points, but improved validation Gini by only 0.0008 ($0.3972$ vs. $0.3964$). Because the business objective prioritises stable out-of-sample ranking and transparent unit-based interpretation, the linear specification was retained. The comparison focused on ranking performance; future redevelopment should also compare out-of-sample calibration and Brier score before definitively rejecting the transformed specification. The likelihood improvement nevertheless suggests that the transformations may better represent aspects of the conditional probability surface and should remain a candidate in future calibration work. However, this check does not rule out potential nonlinear effects for interest rate, utilization, inquiries, or public records.
+
+```{r visual_effects, fig.cap="Standardized odds ratios and marginal interest rate probability profile.", fig.height=3.6, fig.width=7.2, out.width="100%"}
+sd_inc   <- sd(train$annual_inc)
+sd_util  <- sd(train$revol_util)
+sd_bal   <- sd(train$revol_bal)
+sd_rate  <- sd(train$int_rate)
+
+plot_effects <- data.frame(
+  Predictor = c(
+    "Purpose: Small Business",
+    "Employment: Unknown",
+    "Term: 60 Months",
+    "Interest Rate (+1 SD: 3.7%)",
+    "Inquiries (+1 Count)",
+    "Public Records (+1 Count)",
+    "Revolving Util. (+1 SD: 28%)",
+    "Revolving Bal. (+1 SD: $19k)",
+    "Annual Income (+1 SD: $67k)"
+  ),
+  OR = c(
+    exp(coef(fit_logit)["purposesmall_business"]),
+    exp(coef(fit_logit)["emp_lengthUnknown"]),
+    exp(coef(fit_logit)["term60 months"]),
+    exp(coef(fit_logit)["int_rate"] * sd_rate),
+    exp(coef(fit_logit)["inq_last_6mths"]),
+    exp(coef(fit_logit)["pub_rec"]),
+    exp(coef(fit_logit)["revol_util"] * sd_util),
+    exp(coef(fit_logit)["revol_bal"] * sd_bal),
+    exp(coef(fit_logit)["annual_inc"] * sd_inc)
+  ),
+  Lower = c(
+    exp(ci_wald["purposesmall_business", 1]),
+    exp(ci_wald["emp_lengthUnknown", 1]),
+    exp(ci_wald["term60 months", 1]),
+    exp(ci_wald["int_rate", 1] * sd_rate),
+    exp(ci_wald["inq_last_6mths", 1]),
+    exp(ci_wald["pub_rec", 1]),
+    exp(ci_wald["revol_util", 1] * sd_util),
+    exp(ci_wald["revol_bal", 1] * sd_bal),
+    exp(ci_wald["annual_inc", 1] * sd_inc)
+  ),
+  Upper = c(
+    exp(ci_wald["purposesmall_business", 2]),
+    exp(ci_wald["emp_lengthUnknown", 2]),
+    exp(ci_wald["term60 months", 2]),
+    exp(ci_wald["int_rate", 2] * sd_rate),
+    exp(ci_wald["inq_last_6mths", 2]),
+    exp(ci_wald["pub_rec", 2]),
+    exp(ci_wald["revol_util", 2] * sd_util),
+    exp(ci_wald["revol_bal", 2] * sd_bal),
+    exp(ci_wald["annual_inc", 2] * sd_inc)
   )
-```
+)
 
-While coefficient plots cleanly identify the direction of risk drivers, they display log-odds, which are notoriously difficult to interpret in a business context. To translate these mathematical estimates into actionable insights, we calculate and plot the marginal predicted effects. This demonstrates exactly how the absolute predicted probability of default scales as a borrower's interest rate increases, holding all other variables constant at their baseline.
-
-```{r marginal_effects, fig.height=4, fig.width=7}
-pr_int <- ggpredict(fit_logit, terms = "int_rate [all]")
-plot(pr_int) +
+p_or <- ggplot(plot_effects, aes(x = reorder(Predictor, OR), y = OR, color = OR > 1)) +
+  geom_point(size = 2.2) +
+  geom_errorbar(aes(ymin = Lower, ymax = Upper), width = 0.25, linewidth = 0.7) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "gray40") +
+  coord_flip() +
+  scale_color_manual(values = c("navy", "firebrick")) +
+  theme_minimal(base_size = 8) +
   labs(
-    title = "Marginal Effect of Interest Rate on Default Probability",
-    x = "Interest Rate (Scaled)",
-    y = "Predicted Probability of Default"
+    title = "Standardized Risk Multipliers",
+    subtitle = "1-SD continuous increments & factor contrasts",
+    x = "", y = "Odds Ratio"
   ) +
-  theme_minimal()
+  theme(legend.position = "none", plot.title = element_text(face = "bold", size = 9),
+        plot.subtitle = element_text(size = 7), axis.text = element_text(size = 7))
+
+pr_int <- ggpredict(fit_logit, terms = "int_rate [all]")
+p_mg <- plot(pr_int) +
+  labs(
+    title = "Marginal Default Probability",
+    subtitle = "Across interest rate range",
+    x = "Interest Rate (%)",
+    y = "Predicted Default Probability"
+  ) +
+  theme_minimal(base_size = 8) +
+  theme(plot.title = element_text(face = "bold", size = 9),
+        plot.subtitle = element_text(size = 7), axis.text = element_text(size = 7))
+
+p_or + p_mg + plot_layout(widths = c(1.15, 0.85))
 ```
 
-A model's ability to rank-order risk is insufficient if its absolute probability predictions are systematically inaccurate. To satisfy strict diagnostic requirements, we generate a binned residual plot to check for severe non-linearities, and a calibration diagram to verify that predicted default probabilities align with real-world outcomes.
+## Model Diagnostics and Out-of-Sample Calibration
+A scoring engine must demonstrate reliable probability calibration on unseen data. Rather than evaluating calibration in-sample (which yields optimistically tight tracking), Figure 2 evaluates binned residuals on training cases and decile calibration strictly out-of-sample on the validation set ($N = 7,683$).
 
-```{r model_diagnostics, fig.height=5, fig.width=10}
-library(gridExtra)
-pred_train <- fitted(fit_logit)
-resid_train <- residuals(fit_logit, type = "response")
+```{r diagnostics_and_calibration, fig.cap="Training binned response residuals and out-of-sample decile calibration.", fig.height=3.4, fig.width=7.2, out.width="100%"}
+pred_tr <- fitted(fit_logit)
+resid_tr <- residuals(fit_logit, type = "response")
 
-bp_df <- data.frame(Expected = pred_train, Residual = resid_train) %>%
-  mutate(Bin = ntile(Expected, 50)) %>%
+binned_df <- data.frame(Expected = pred_tr, Residual = resid_tr) %>%
+  mutate(Bin = ntile(Expected, 40)) %>%
   group_by(Bin) %>%
   summarise(
-    x = mean(Expected),
-    y = mean(Residual),
-    se = sd(Residual) / sqrt(n()),
-    lower = -2 * se,
-    upper = 2 * se
+    Mean_Expected = mean(Expected),
+    Mean_Residual = mean(Residual),
+    SE = sqrt(mean(Expected) * (1 - mean(Expected)) / n()),
+    Lower = -2 * SE,
+    Upper = 2 * SE
   )
 
-p1 <- ggplot(bp_df, aes(x = x,
-    y = y)) +
-  geom_ribbon(aes(ymin = lower, ymax = upper), fill = "gray80", alpha = 0.5) +
-  geom_point(color = "black", size = 2) +
-  geom_hline(yintercept = 0, color = "red", linetype = "dashed", linewidth = 1) +
+p_resid <- ggplot(binned_df, aes(x = Mean_Expected, y = Mean_Residual)) +
+  geom_ribbon(aes(ymin = Lower, ymax = Upper), fill = "gray80", alpha = 0.6) +
+  geom_point(color = "black", size = 1.5) +
+  geom_hline(yintercept = 0, color = "firebrick", linetype = "dashed") +
   labs(
-    title = "Binned Residual Diagnostics",
-    subtitle = "Evaluating structural fit across expected values",
-    x = "Expected Probability of Default",
-    y = "Average Residual") +
-  theme_minimal()
+    title = "Binned Residual Plot (Training Set)",
+    subtitle = "Shaded band indicates 95% expected binomial variance",
+    x = "Predicted Default Probability", y = "Average Response Residual"
+  ) +
+  theme_minimal(base_size = 8) +
+  theme(plot.title = element_text(face = "bold", size = 9),
+        plot.subtitle = element_text(size = 7), axis.text = element_text(size = 7))
 
-deciles <- ntile(pred_train, 10)
-calib_data <- data.frame(Pred = pred_train,
-  Obs = train$repay_fail, Decile = deciles)
-calib_summary <- calib_data %>%
+pred_val <- predict(fit_logit, newdata = valid, type = "response")
+calib_val <- data.frame(Pred = pred_val, Obs = valid$repay_fail) %>%
+  mutate(Decile = ntile(Pred, 10)) %>%
   group_by(Decile) %>%
   summarise(Mean_Pred = mean(Pred), Mean_Obs = mean(Obs))
 
-p2 <- ggplot(calib_summary, aes(x = Mean_Pred,
-    y = Mean_Obs)) +
-  geom_point(color = "blue", size = 3) +
-  geom_line(color = "blue", linewidth = 1) +
-  geom_abline(intercept = 0,
-  slope = 1,
-  color = "red", linetype = "dashed", linewidth = 1) +
-  annotate("text",
-    x = 0.08,
-    y = 0.15,
-    label = "Perfect\nCalibration", color = "red",
-    angle = 45, fontface = "bold"
-  ) +
-  labs(
-    title = "Calibration Accuracy",
-    subtitle = "Predicted probabilities vs. actual default rates",
-    x = "Predicted Probability",
-    y = "Observed Default Rate") +
-  theme_minimal()
+# Standard calibration model on the logit scale: logit(Y) = alpha + beta * logit(p_hat)
+calib_glm <- glm(valid$repay_fail ~ log(pred_val / (1 - pred_val)), family = binomial)
+calib_intercept <- coef(calib_glm)[1]
+calib_slope <- coef(calib_glm)[2]
+ci_calib <- confint.default(calib_glm)
 
-grid.arrange(p1, p2, ncol = 2)
+p_calib <- ggplot(calib_val, aes(x = Mean_Pred, y = Mean_Obs)) +
+  geom_point(color = "darkblue", size = 2.0) +
+  geom_line(color = "darkblue", linewidth = 0.8) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "firebrick", linewidth = 0.8) +
+  annotate("text", x = 0.08, y = 0.22, label = "Ideal 45° Line", color = "firebrick", angle = 45, fontface = "bold", size = 2.8) +
+  annotate("text", x = 0.25, y = 0.08, 
+           label = sprintf("Calib Slope: %.2f\nCalib Intercept: %.2f", calib_slope, calib_intercept),
+           color = "darkblue", fontface = "italic", size = 2.8) +
+  labs(
+    title = "Out-of-Sample Decile Calibration (Validation Set)",
+    subtitle = "Observed default rate vs. mean predicted probability",
+    x = "Predicted Probability Decile", y = "Observed Default Frequency"
+  ) +
+  theme_minimal(base_size = 8) +
+  theme(plot.title = element_text(face = "bold", size = 9),
+        plot.subtitle = element_text(size = 7), axis.text = element_text(size = 7))
+
+p_resid + p_calib + plot_layout(widths = c(1, 1))
 ```
 
-The model diagnostics confirm a highly robust statistical fit. The binned residuals exhibit no severe structural patterns that would mandate splines or heavy transformations, while the calibration plot tracks the ideal diagonal line tightly. A predicted default risk of 20% genuinely corresponds to an observed portfolio default rate of 20%, ensuring that capital reserve calculations based on these probabilities will be dependable.
+The binned residuals show that bin averages lie within the 95% binomial theoretical bounds ($\pm 2 SE$). Validation calibration was evaluated via logistic regression of observed default status against the linear log-odds predictor: $\text{logit}(Y) = \alpha + \beta \cdot \text{logit}(\hat{p})$. The fitted calibration slope of `r round(calib_slope, 2)` (95% CI: [`r sprintf("%.2f, %.2f", ci_calib[2,1], ci_calib[2,2])`]) and intercept of `r round(calib_intercept, 2)` (95% CI: [`r sprintf("%.2f, %.2f", ci_calib[1,1], ci_calib[1,2])`]) are close to the ideal values of one and zero, respectively, with their 95% confidence intervals encompassing 1.0 and 0.0. This supports broadly acceptable calibration on the validation sample across low-to-moderate risk deciles, tracking the ideal 45-degree line closely. At the extreme high-risk tail ($p > 0.35$), moderate variance emerges; we conclude that validation calibration is broadly acceptable, with higher uncertainty among the highest-risk applicants.
 
-## Out-of-Sample Evaluation and Business Metrics
-We evaluate the finalized model on the strictly quarantined testing set to accurately estimate true operational performance.
+## Final Out-of-Sample Performance and Previous Benchmark Comparison
+To formally address Management Question 1, we evaluate our final GLM on the quarantined testing dataset ($N = 7,684$) and compare performance against the legacy benchmark figures supplied by senior financial analysts (Figure 1: Train Gini = 0.114, Validation Gini = 0.110).
 
-```{r test_eval, fig.height=5, fig.width=10}
-pred_test <- predict(fit_logit, newdata = test, type = "response")
-roc_obj <- roc(test$repay_fail, pred_test, quiet = TRUE)
-test_gini <- 2 * as.numeric(auc(roc_obj)) - 1
+```{r benchmark_comparison_table}
+p_tr   <- predict(fit_logit, newdata = train, type = "response")
+p_val  <- predict(fit_logit, newdata = valid, type = "response")
+p_test <- predict(fit_logit, newdata = test,  type = "response")
 
-pred_rocr <- prediction(pred_test, test$repay_fail)
+roc_tr   <- roc(train$repay_fail, p_tr, quiet = TRUE)
+roc_val  <- roc(valid$repay_fail, p_val, quiet = TRUE)
+roc_test <- roc(test$repay_fail,  p_test, quiet = TRUE)
+
+ci_roc_val  <- ci.auc(roc_val)
+ci_roc_test <- ci.auc(roc_test)
+
+comp_table <- data.frame(
+  Model = c(
+    "Legacy Ad-Hoc Benchmark", 
+    "Legacy Ad-Hoc Benchmark", 
+    "Rebuilt Binomial GLM", 
+    "Rebuilt Binomial GLM", 
+    "Rebuilt Binomial GLM"
+  ),
+  Partition = c("Training", "Validation", "Training", "Validation", "Testing (Held-Out)"),
+  N = c(23052, 7683, 23052, 7683, 7684),
+  AUC = c(0.557, 0.555, round(as.numeric(auc(roc_tr)), 3), 
+          round(as.numeric(auc(roc_val)), 3), round(as.numeric(auc(roc_test)), 3)),
+  Gini = c(0.114, 0.110, round(2 * as.numeric(auc(roc_tr)) - 1, 3), 
+           round(2 * as.numeric(auc(roc_val)) - 1, 3), round(2 * as.numeric(auc(roc_test)) - 1, 3)),
+  `95% CI` = c(
+    "Not Disclosed", 
+    "Not Disclosed", 
+    "In-Sample",
+    sprintf("[%.3f, %.3f]", 2 * ci_roc_val[1] - 1, 2 * ci_roc_val[3] - 1),
+    sprintf("[%.3f, %.3f]", 2 * ci_roc_test[1] - 1, 2 * ci_roc_test[3] - 1)
+  ),
+  Difference = c("-", "-", "+0.296", "+0.286", "N/A (Not provided)"),
+  check.names = FALSE
+)
+kable(comp_table, booktabs = TRUE, caption = "GLM performance versus legacy benchmark") |>
+  kable_styling(latex_options = "hold_position", font_size = 8) |>
+  column_spec(1, width = "3.4cm") |>
+  column_spec(2, width = "2.2cm") |>
+  column_spec(3:5, width = "1.2cm") |>
+  column_spec(6, width = "2.0cm") |>
+  column_spec(7, width = "2.4cm")
+```
+
+The difference between the models on common validation data is substantial:
+$$\Delta \text{Gini}_{\text{Validation}} = \text{Gini}_{\text{New}} - \text{Gini}_{\text{Old}} = 0.3964 - 0.1100 = +0.2864 \quad (+28.6 \text{ Gini points})$$
+On unseen testing data, the model yields a Gini of $0.3735$ ($\text{AUC} = 0.6868$, 95% CI: $[0.6705, 0.7030]$) and a Kolmogorov-Smirnov (KS) statistic of $0.280$ (measuring the maximum vertical separation between the cumulative score distributions of defaulting and non-defaulting borrowers, achieved at the highest-risk $40.1\%$ of applicants). The test-set delta versus legacy benchmark is not computed directly because legacy predictions were not supplied for the test partition. This indicates moderate rank-ordering discrimination that remained broadly stable across validation, cross-validation, and held-out testing.
+
+```{r test_discrimination_plots, fig.cap="Out-of-sample ROC discrimination and cumulative gains on held-out test data (N = 7,684).", fig.height=3.4, fig.width=7.2, out.width="100%"}
+pred_rocr <- prediction(p_test, test$repay_fail)
 perf_ks <- performance(pred_rocr, "tpr", "fpr")
 ks_stat <- max(attr(perf_ks, "y.values")[[1]] - attr(perf_ks, "x.values")[[1]])
 
-roc_data <- data.frame(FPR = 1 - roc_obj$specificities,
-  TPR = roc_obj$sensitivities)
-p3 <- ggplot(roc_data, aes(x = FPR,
-    y = TPR)) +
-  geom_ribbon(aes(ymin = 0, ymax = TPR), fill = "blue", alpha = 0.1) +
-  geom_line(color = "blue", linewidth = 1.2) +
-  geom_abline(intercept = 0,
-  slope = 1,
-  color = "red", linetype = "dashed", linewidth = 1) +
-  annotate("text",
-    x = 0.75,
-    y = 0.25, label = paste("Gini:", round(test_gini, 3)),
-    size = 5, color = "darkblue", fontface = "bold"
-  ) +
+roc_df <- data.frame(FPR = 1 - roc_test$specificities, TPR = roc_test$sensitivities)
+p_roc <- ggplot(roc_df, aes(x = FPR, y = TPR)) +
+  geom_ribbon(aes(ymin = 0, ymax = TPR), fill = "navy", alpha = 0.1) +
+  geom_line(color = "navy", linewidth = 0.9) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray40") +
+  annotate("text", x = 0.7, y = 0.25, 
+           label = sprintf("Test Gini: %.3f\nTest AUC: %.3f", 2 * as.numeric(auc(roc_test)) - 1, as.numeric(auc(roc_test))),
+           size = 3.0, fontface = "bold", color = "navy") +
   labs(
     title = "Test ROC Curve",
-    subtitle = "Discrimination power on unseen data",
-    x = "False Positive Rate",
-    y = "True Positive Rate") +
-  theme_minimal()
+    subtitle = "Quarantined test partition",
+    x = "False Positive Rate (1 - Specificity)", y = "True Positive Rate (Sensitivity)"
+  ) +
+  theme_minimal(base_size = 8) +
+  theme(plot.title = element_text(face = "bold", size = 9),
+        plot.subtitle = element_text(size = 7), axis.text = element_text(size = 7))
 
 perf_gains <- performance(pred_rocr, "tpr", "rpp")
-gains_data <- data.frame(RPP = attr(perf_gains,
-  "x.values")[[1]],
-  TPR = attr(perf_gains, "y.values")[[1]])
+gains_df <- data.frame(RPP = attr(perf_gains, "x.values")[[1]], TPR = attr(perf_gains, "y.values")[[1]])
 diffs <- attr(perf_ks, "y.values")[[1]] - attr(perf_ks, "x.values")[[1]]
 ks_idx <- which.max(diffs)
-ks_rpp <- attr(perf_gains, "x.values")[[1]][ks_idx]
-ks_tpr <- attr(perf_gains, "y.values")[[1]][ks_idx]
+ks_rpp <- gains_df$RPP[ks_idx]
+ks_tpr <- gains_df$TPR[ks_idx]
 
-p4 <- ggplot(gains_data, aes(x = RPP,
-    y = TPR)) +
+p_gains <- ggplot(gains_df, aes(x = RPP, y = TPR)) +
   geom_ribbon(aes(ymin = RPP, ymax = TPR), fill = "darkgreen", alpha = 0.1) +
-  geom_line(color = "darkgreen", linewidth = 1.2) +
-  geom_abline(intercept = 0,
-  slope = 1,
-  color = "red", linetype = "dashed", linewidth = 1) +
-  annotate("segment",
-    x = ks_rpp, xend = ks_rpp,
-    y = ks_rpp, yend = ks_tpr, color = "black", linetype = "dotted", linewidth = 1) +
-  annotate("point",
-    x = ks_rpp,
-    y = ks_tpr, color = "black", size = 3) +
-  annotate("text",
-    x = ks_rpp + 0.18,
-    y = (ks_rpp + ks_tpr) / 2, label = paste("Max KS:", round(ks_stat, 3)),
-    color = "black", fontface = "bold"
-  ) +
+  geom_line(color = "darkgreen", linewidth = 0.9) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray40") +
+  annotate("segment", x = ks_rpp, xend = ks_rpp, y = ks_rpp, yend = ks_tpr, color = "black", linetype = "dotted", linewidth = 0.8) +
+  annotate("point", x = ks_rpp, y = ks_tpr, color = "black", size = 1.8) +
+  annotate("text", x = ks_rpp + 0.22, y = (ks_rpp + ks_tpr) / 2,
+           label = sprintf("Max KS: %.3f\n(at top %.1f%% pop)", ks_stat, ks_rpp * 100),
+           fontface = "bold", size = 2.8) +
   labs(
-    title = "Test Gains Chart",
-    subtitle = "Capture rate across portfolio depth",
-    x = "Rate of Positive Predictions",
-    y = "True Positive Rate") +
-  theme_minimal()
+    title = "Test Cumulative Gains",
+    subtitle = "Default capture across underwriting depth",
+    x = "Cumulative Proportion Screened", y = "Cumulative Defaults Captured"
+  ) +
+  theme_minimal(base_size = 8) +
+  theme(plot.title = element_text(face = "bold", size = 9),
+        plot.subtitle = element_text(size = 7), axis.text = element_text(size = 7))
 
-grid.arrange(p3, p4, ncol = 2)
+p_roc + p_gains + plot_layout(widths = c(1, 1))
 ```
 
-The model achieves a highly competitive Gini coefficient, proving its rank-ordering superiority over the prior ad-hoc benchmark. The Gains chart and Kolmogorov-Smirnov statistic further demonstrate our ability to capture a disproportionate share of defaults within the highest-risk deciles. To operationalize the model, we apply a 15% probability threshold, purposely mirroring the portfolio's historical base default rate to maintain pipeline volume.
+## Illustrative Decision Policy Scenario
+In retail lending, selecting a classification cutoff by maximizing raw overall accuracy is mathematically flawed. Because default prevalence is $\approx 14.9\%$, a trivial zero-information rule classifying 100% of loans as "non-default" achieves an apparent accuracy of $85.1\%$, while completely failing to prevent loan charge-offs. 
 
-```{r conf_matrix}
-pred_class <- ifelse(pred_test > 0.15, 1, 0)
+Credit risk policy is governed by asymmetric misclassification costs:
+$$\text{Expected Loss} = C_{\text{FN}} \cdot \text{FN} + C_{\text{FP}} \cdot \text{FP}$$
+where the cost of a false negative ($C_{\text{FN}}$, issuing a loan that defaults, leading to loss of principal) typically exceeds the opportunity cost of a false positive ($C_{\text{FP}}$, rejecting a solvent applicant, leading to lost interest margin).
+
+```{r confusion_matrix_analysis}
+threshold <- 0.15
+pred_class <- ifelse(p_test > threshold, 1, 0)
 cm <- confusionMatrix(
-  as.factor(pred_class), as.factor(test$repay_fail),
+  as.factor(pred_class), 
+  as.factor(test$repay_fail), 
   positive = "1"
 )
-print(cm)
 
-approval_rate <- sum(pred_class == 0) / length(pred_class)
-default_rate_of_approved <- sum(pred_class == 0 & test$repay_fail == 1) /
-  sum(pred_class == 0)
+n_total <- nrow(test)
+n_approved <- sum(pred_class == 0)
+n_rejected <- sum(pred_class == 1)
+approval_rate <- n_approved / n_total
+default_rate_of_approved <- sum(pred_class == 0 & test$repay_fail == 1) / n_approved
+
+policy_summary <- data.frame(
+  `Operational Metric` = c(
+    "Policy Scenario Threshold",
+    "Portfolio Approval Rate",
+    "Approved Pipeline Volume",
+    "Default Rate of Approved Loans",
+    "Default Capture Sensitivity (Recall)",
+    "Specificity (Non-Default Retention)",
+    "Positive Predictive Value (Precision)",
+    "Overall Classification Accuracy",
+    "No-Information Base Rate (Prevalence)"
+  ),
+  `Policy Value` = c(
+    "15.0% (Illustrative)",
+    sprintf("%.1f%%", approval_rate * 100),
+    sprintf("%d / %d", n_approved, n_total),
+    sprintf("%.1f%% (down from 14.9%%)", default_rate_of_approved * 100),
+    sprintf("%.1f%%", cm$byClass["Sensitivity"] * 100),
+    sprintf("%.1f%%", cm$byClass["Specificity"] * 100),
+    sprintf("%.1f%%", cm$byClass["Pos Pred Value"] * 100),
+    sprintf("%.1f%%", cm$overall["Accuracy"] * 100),
+    sprintf("%.1f%%", cm$overall["AccuracyNull"] * 100)
+  ),
+  check.names = FALSE
+)
+kable(policy_summary, booktabs = TRUE, caption = "Confusion matrix at 15% probability cutoff") |>
+  kable_styling(latex_options = "hold_position", font_size = 8.5)
 ```
 
-This strategic cutoff allows the institution to manage risk effectively while maintaining an optimal approval pipeline. The confusion matrix confirms robust sensitivity to actual defaults, minimizing devastating financial losses without crippling approval volumes.
+The 15% threshold is presented as an illustrative policy scenario rather than an economically optimized cutoff. Under this scenario, the bank approves $60.6\%$ of incoming volume while driving the default rate within the approved portfolio down to $9.2\%$. The model successfully flags $62.5\%$ of all defaulting borrowers. Precision is $23.6\%$, indicating that roughly three out of four flagged applications are non-defaults; this threshold represents a policy scenario that places relatively greater weight on default capture than on retaining every non-defaulting applicant. True production cutoff optimization requires bank-specific estimates of Exposure at Default (EAD), Loss Given Default (LGD), and net interest margin.
 
-# Phase 2: Advanced Spatial-Temporal Modeling (GLMM)
-The benchmark model assumes that baseline risk is entirely uniform across all jurisdictions and time periods. To rigorously verify this hypothesis and capture massive macro-level shifts—such as the Global Financial Crisis—we extend our framework to a Mixed Effects model using an expanded dataset provided by management.
+\newpage
 
-## Data Augmentation and Scaling
-We integrate the extended spatial-temporal dataset, meticulously parsing the issue date to extract a chronological year variable. This allows us to separate structural economic drift from localized monthly noise. To ensure numerical stability during the complex maximum likelihood optimization of the GLMM, all continuous predictors are scaled, and the issue year is explicitly centered on the beginning of 2007.
+# Advanced Spatial-Temporal Modeling (GLMM)
 
-```{r ext_data}
+## Extended Dataset Structure and Preprocessing
+The benchmark GLM assumes that baseline default risk is spatially and temporally homogeneous across all jurisdictions and economic climates. Under the guidance of statistical consultant Prof. A. N. Omynous, management commissioned an investigation of an expanded dataset ($N = 38,419$) that incorporates the applicant's state (`addr_state`, 50 jurisdictions) and origination month (`issue_d`, 55 consecutive months spanning 2007 to 2011).
+
+```{r ext_data_prep}
 ext <- read.csv("data/extendend_version_loan_data.csv")
-ext <- clean_data(ext)
+ext <- clean_benchmark(ext)
 
 ext$issue_d_date <- dmy(paste0("01-", ext$issue_d))
 ext$issue_year <- (year(ext$issue_d_date) + (month(ext$issue_d_date) - 1) / 12) - 2007
@@ -333,214 +668,925 @@ ext$addr_state <- as.factor(ext$addr_state)
 set.seed(42)
 ext_idx <- createDataPartition(ext$repay_fail, p = 0.8, list = FALSE)
 ext_train <- ext[ext_idx, ]
-ext_test <- ext[-ext_idx, ]
+ext_test  <- ext[-ext_idx, ]
 
-cont_vars <- c("loan_amnt",
-  "int_rate", "annual_inc", "inq_last_6mths", "pub_rec", "revol_bal", "revol_util")
-for (v in cont_vars) {
-  ext_train[[v]] <- scale(ext_train[[v]])
-  ext_test[[v]] <- scale(
-    ext_test[[v]], 
-    center = attr(ext_train[[v]], "scaled:center"), 
-    scale = attr(ext_train[[v]], "scaled:scale")
+nom_ext <- c("term", "home_ownership", "verification_status", "purpose", "emp_length", "addr_state")
+ext_test <- align_factor_levels(ext_test, ext_train, nom_ext)
+stopifnot(nrow(ext_train) == 30736, nrow(ext_test) == 7683)
+
+cont_vars <- c("loan_amnt", "int_rate", "annual_inc", "inq_last_6mths", "pub_rec", "revol_bal", "revol_util")
+scaling_parameters <- lapply(cont_vars, function(variable) {
+  c(
+    center = mean(ext_train[[variable]], na.rm = TRUE),
+    scale  = sd(ext_train[[variable]], na.rm = TRUE)
   )
+})
+names(scaling_parameters) <- cont_vars
+
+for (variable in cont_vars) {
+  center_val <- scaling_parameters[[variable]][["center"]]
+  scale_val  <- scaling_parameters[[variable]][["scale"]]
+  ext_train[[variable]] <- as.numeric((ext_train[[variable]] - center_val) / scale_val)
+  ext_test[[variable]]  <- as.numeric((ext_test[[variable]] - center_val) / scale_val)
 }
 ```
 
-## Mixed Effects Estimation and Convergence
-We specify a GLMM that incorporates our proven fixed-effect predictors alongside a continuous fixed trend for the issue year. Furthermore, we introduce random effects for the applicant's state and the specific issue month. 
+## Comparable Model Hierarchy and Singularity Resolution
+To determine the precise origin of predictive gains, we evaluate a systematic, nested hierarchy of five models fitted to the exact same training partition and evaluated on the identical test partition:
 
-Crucially, we employ both a **Random Intercept** and a **Random Slope** for the state variable `(1 + int_rate | addr_state)`. While the random intercept captures the baseline risk of a state, the random slope allows us to test a complex hypothesis: *Does the penalty of a high interest rate vary depending on which state the borrower lives in?* 
+1. **Model 1 (Flat GLM):** Benchmark borrower covariates only.
+2. **Model 2 (Trend GLM):** Borrower covariates + fixed continuous `issue_year` trend.
+3. **Model 3 (State GLMM):** Trend GLM + state random intercepts $(1 \mid \text{addr\_state})$.
+4. **Model 4 (Spatial-Temporal GLMM):** Trend GLM + state random intercepts + issue month random intercepts $(1 \mid \text{addr\_state}) + (1 \mid \text{issue\_d})$.
+5. **Model 5 (Random Slope GLMM):** Trend GLM + correlated state intercept and interest-rate slope + issue month $(1 + \text{int\_rate} \mid \text{addr\_state}) + (1 \mid \text{issue\_d})$.
 
-This architecture effectively allows the model to shrink highly uncertain, low-sample state estimates (such as those from sparse regions) toward the national average, preventing dangerous over-reaction to limited data.
+```{r glmm_model_fits}
+# Formulas defining the nested hierarchy
+m2_form <- update(formula_sel, ~ . + issue_year)
+m3_form <- update(m2_form, ~ . + (1 | addr_state))
+m4_form <- update(m2_form, ~ . + (1 | addr_state) + (1 | issue_d))
+m5_form <- update(m2_form, ~ . + (1 + int_rate | addr_state) + (1 | issue_d))
 
-```{r glmm_fit, cache=TRUE, warning=TRUE}
-fit_ext_glm <- glm(formula_sel, data = ext_train, family = binomial(link = "logit"))
+# Extract pre-fitted spatial-temporal hierarchy models from assets/glmm_models.rds
+m1_glm        <- glmm_models$m1_glm
+m2_trend_glm  <- glmm_models$m2_trend_glm
+m3_state_glmm <- glmm_models$m3_state_glmm
+m4_st_glmm    <- glmm_models$m4_st_glmm
+m5_slope_glmm <- glmm_models$m5_slope_glmm
+```
 
-glmm_form <- update(
-  formula_sel,
-  ~ . + issue_year + (1 + int_rate | addr_state) + (1 | issue_d)
+```{r glmm_hierarchy_table}
+p_m1 <- predict(m1_glm, newdata = ext_test, type = "response")
+p_m2 <- predict(m2_trend_glm, newdata = ext_test, type = "response")
+p_m3 <- predict(m3_state_glmm, newdata = ext_test, type = "response", allow.new.levels = TRUE)
+p_m4 <- predict(m4_st_glmm, newdata = ext_test, type = "response", allow.new.levels = TRUE)
+p_m5 <- predict(m5_slope_glmm, newdata = ext_test, type = "response", allow.new.levels = TRUE)
+
+get_ext_gini <- function(preds) {
+  2 * as.numeric(auc(roc(ext_test$repay_fail, preds, quiet = TRUE))) - 1
+}
+
+model_comp <- data.frame(
+  Model = c(
+    "M1: Flat GLM (Borrower Only)",
+    "M2: Trend GLM (+ Issue Year)",
+    "M3: State GLMM (+ State RE)",
+    "M4: Spatial-Temporal GLMM (+ State & Month RE)",
+    "M5: Random Slope GLMM (+ State Slope)"
+  ),
+  Df = c(32, 33, 34, 35, 37),
+  AIC = sprintf("%.2f", c(AIC(m1_glm), AIC(m2_trend_glm), AIC(m3_state_glmm), AIC(m4_st_glmm), AIC(m5_slope_glmm))),
+  BIC = sprintf("%.2f", c(BIC(m1_glm), BIC(m2_trend_glm), BIC(m3_state_glmm), BIC(m4_st_glmm), BIC(m5_slope_glmm))),
+  `Random-Split Conditional Test Gini` = sprintf("%.4f", c(get_ext_gini(p_m1), get_ext_gini(p_m2), get_ext_gini(p_m3), get_ext_gini(p_m4), get_ext_gini(p_m5))),
+  `Singular Fit` = c("No (GLM)", "No (GLM)", ifelse(isSingular(m3_state_glmm), "Yes", "No"), ifelse(isSingular(m4_st_glmm), "Yes", "No"), ifelse(isSingular(m5_slope_glmm), "Yes", "No")),
+  check.names = FALSE
 )
-fit_glmm <- glmer(glmm_form,
-  data = ext_train, family = binomial(link = "logit"),
-  control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e5))
+kable(model_comp, booktabs = TRUE, caption = "Spatial-temporal model comparison (conditional random split)") |>
+  kable_styling(latex_options = "hold_position", font_size = 8) |>
+  column_spec(1, width = "4.6cm") |>
+  column_spec(2, width = "0.8cm") |>
+  column_spec(3:4, width = "1.7cm") |>
+  column_spec(5, width = "2.1cm") |>
+  column_spec(6, width = "1.6cm")
+```
+
+### Critical Findings on Singularity and Model Selection
+1. **Diagnosis of Singularity in Model 5:** When attempting to estimate a random slope for interest rate across states (`m5_slope_glmm`), the optimization flags a singular fit (`isSingular = TRUE`). The estimated random-slope variance is near boundary zero ($\sigma^2_{\text{slope}} \approx 0.0004$) and perfectly collinear with the random intercept ($\rho = -1.00$). The empirical data do not possess the statistical richness required to support state-specific interest-rate sensitivities.
+2. **Parsimonious Selection of Model 4:** The random-intercept model (`m4_st_glmm`) is non-singular (`isSingular = FALSE`) and achieves the lowest AIC ($23,880.45$) and lowest BIC ($24,172.11$) among all candidates. Model 4 was selected primarily using non-singularity, parsimony, AIC, and BIC. The random-split conditional test Gini ($0.3897$) is reported descriptively and should not be interpreted as a fully untouched final evaluation after model comparison; following foundational principles of statistical parsimony (Bates et al., 2015), **Model 4 was retained as the preferred candidate within the evaluated model set**, with the 2011 temporal holdout serving as the independent forward-validation benchmark.
+3. **Quasi-Separation Warning in Extended GLM:** The extended-data GLM produced fitted probabilities numerically close to zero or one, indicating potentially sparse predictor combinations or extreme linear predictors in certain subcategories. The retained GLMM did not exhibit convergence or singularity problems. Its random intercepts provide model-based partial pooling across state and month groups, although this does not constitute Bayesian estimation or automatically resolve complete separation among fixed-effect categories.
+
+## Temporal Holdout Validation: Eliminating Data Leakage
+A critical vulnerability of random 80/20 data partitioning in longitudinal datasets is **temporal leakage**. In a random split, every origination month appears in both training and test sets. Consequently, the test set evaluates predictions on new borrowers originating in *already observed months*, reusing learned month-specific random intercepts.
+
+To rigorously evaluate how the scoring engine generalizes to future origination vintages, we implement **Temporal Holdout Validation**: training on loans issued between June 2007 and December 2010 ($N = 18,781$), and evaluating on applications issued in 2011 ($N = 19,638$). The temporal split was defined by origination period rather than by a predetermined sample ratio, producing a comparatively large 2011 holdout. For future applications where the origination month has no historical random effect, predictions are evaluated at the population level ($\text{re.form} = \text{NA}$) or using geographic effects alone ($\text{re.form} = \sim(1 \mid \text{addr\_state})$).
+
+```{r temporal_holdout}
+cutoff_date <- as.Date("2011-01-01")
+th_train <- ext[ext$issue_d_date < cutoff_date, ]
+th_test  <- ext[ext$issue_d_date >= cutoff_date, ]
+
+th_scaling <- lapply(cont_vars, function(variable) {
+  c(
+    center = mean(th_train[[variable]], na.rm = TRUE),
+    scale  = sd(th_train[[variable]], na.rm = TRUE)
+  )
+})
+names(th_scaling) <- cont_vars
+
+for (variable in cont_vars) {
+  center_val <- th_scaling[[variable]][["center"]]
+  scale_val  <- th_scaling[[variable]][["scale"]]
+  th_train[[variable]] <- as.numeric((th_train[[variable]] - center_val) / scale_val)
+  th_test[[variable]]  <- as.numeric((th_test[[variable]] - center_val) / scale_val)
+}
+
+th_test <- align_factor_levels(th_test, th_train, nom_ext)
+stopifnot(nrow(th_train) == 18781, nrow(th_test) == 19638)
+
+# Extract pre-fitted temporal holdout models from assets/glmm_models.rds
+th_glm   <- glmm_models$th_glm
+th_trend <- glmm_models$th_trend
+th_glmm  <- glmm_models$th_glmm
+
+p_th_glm   <- predict(th_glm, newdata = th_test, type = "response")
+p_th_trend <- predict(th_trend, newdata = th_test, type = "response")
+p_th_glmm_state <- predict(th_glmm, newdata = th_test, type = "response", 
+                           re.form = ~ (1 | addr_state), allow.new.levels = TRUE)
+p_th_glmm_pop   <- predict(th_glmm, newdata = th_test, type = "response", 
+                           re.form = NA)
+
+temporal_res <- data.frame(
+  Validation_Architecture = c(
+    "Flat GLM (Borrower Only)",
+    "Trend GLM (Fixed Year Trend)",
+    "GLMM: State Random Effects (State RE, addr_state)",
+    "GLMM: Pure Population Marginal (Population Level, re.form = NA)"
+  ),
+  Operational_Application = c(
+    "Baseline borrower scoring",
+    "Assumes continuing linear macroeconomic drift",
+    "Scores future loans with known state geographic adjustments",
+    "Scores future loans with zero temporal or regional adjustments"
+  ),
+  Temporal_Holdout_Gini = c(
+    2 * as.numeric(auc(roc(th_test$repay_fail, p_th_glm, quiet = TRUE))) - 1,
+    2 * as.numeric(auc(roc(th_test$repay_fail, p_th_trend, quiet = TRUE))) - 1,
+    2 * as.numeric(auc(roc(th_test$repay_fail, p_th_glmm_state, quiet = TRUE))) - 1,
+    2 * as.numeric(auc(roc(th_test$repay_fail, p_th_glmm_pop, quiet = TRUE))) - 1
+  )
+)
+names(temporal_res) <- c("Evaluation Architecture", "Operational Application", "Holdout Gini")
+kable(temporal_res, digits = 4, booktabs = TRUE, caption = "Performance on 2011 temporal holdout") |>
+  kable_styling(latex_options = "hold_position", font_size = 8) |>
+  column_spec(1, width = "4.2cm") |>
+  column_spec(2, width = "8.4cm") |>
+  column_spec(3, width = "2.0cm")
+```
+
+*Scientific Reality of Temporal Validation:* While the GLMM produced a small gain in random-split testing ($0.3815 \rightarrow 0.3897$), **this gain did not persist under strict temporal validation**. The borrower-only GLM achieved a Gini of **$0.4070$** on 2011 applications, compared with **$0.4069$** for the state-adjusted GLMM and **$0.4034$** for the population GLMM. State and temporal effects therefore appear more valuable for portfolio monitoring and risk decomposition than for materially improving future-vintage applicant ranking.
+
+\newpage
+
+## GLMM Residual Diagnostics via DHARMa Simulation
+The retained spatial-temporal GLMM was assessed using 1,000 conditional DHARMa simulations with an explicitly fixed random seed (`simulateREs = "conditional"`). Conditional simulations evaluate residual behaviour within the observed state and origination-month effects. Because the outcome is binary, DHARMa uses randomised quantile residuals, which are expected to follow a uniform distribution under adequate model specification.
+
+For the borrower-level Bernoulli outcome, the individual residual-versus-fitted DHARMa panel was heavily overplotted and provided limited visual information. The dense randomised quantile-residual cloud obscured the conditional residual-quantile curves. DHARMa guidance notes that general residual and dispersion diagnostics may have limited sensitivity for 0/1 outcomes and recommends examining residuals against meaningful predictors or aggregated groups. Residuals were therefore recalculated by predicted-risk decile for the primary diagnostic figure and separately by jurisdiction and origination month in the supplementary analysis. These grouped diagnostics assess distinct aspects of model adequacy and complement, rather than replace, the individual-level uniformity, dispersion, outlier-frequency, and conditional-quantile tests.
+
+```{r glmm_dharma_setup, include=FALSE}
+# Unpack precomputed DHARMa simulations from assets/dharma_results.rds
+list2env(dharma_results, .GlobalEnv)
+
+risk_decile           <- dplyr::ntile(sim_res$fittedPredictedResponse, 10)
+n_obs                 <- length(sim_res$scaledResiduals)
+n_sim                 <- ncol(sim_res$simulatedResponse)
+expected_outlier_rate <- 2 / (n_sim + 1)
+expected_outliers     <- n_obs * expected_outlier_rate
+observed_outlier_rate <- observed_outliers / n_obs
+```
+
+```{r glmm_dharma_plot, fig.cap="DHARMa diagnostics for the retained spatial-temporal GLMM. The left panel assesses overall scaled-residual uniformity, dispersion, and simulation-envelope outliers using 1,000 conditional simulations. The right panel displays residuals aggregated within ten fitted-risk deciles, with a dashed reference line at the expected median (y = 0.50), an approach recommended for evaluating borrower-level Bernoulli outcomes where individual residual-versus-fitted plots can be visually uninformative. The overall residual diagnostics and grouped risk-decile uniformity test were non-significant. A separate grouped dispersion test identified elevated variability across risk deciles and is discussed in the accompanying text. Temporal dependence between monthly cohorts was assessed separately.", fig.height=4.6, fig.width=7.2, out.width="100%", fig.align="center", fig.pos="H", echo=FALSE, warning=FALSE, message=FALSE}
+old_par <- par(
+  mfrow = c(1, 2),
+  mar = c(4.2, 4.0, 2.2, 1.0),
+  oma = c(0, 0, 0, 0),
+  cex = 0.82
 )
 
-cat("Is model fit singular?", isSingular(fit_glmm), "\n")
-unseen_states <- sum(!(ext_test$addr_state %in% unique(ext_train$addr_state)))
-unseen_times <- sum(!(ext_test$issue_d %in% unique(ext_train$issue_d)))
-cat(
-  "Test rows with unseen states:", unseen_states,
-  "| unseen months:", unseen_times, "\n"
-)
-```
-
-The model optimization concludes successfully without singular fit warnings, proving that our data has enough structural richness to support random slopes. By actively tracking the count of unseen factor levels in the testing set, we ensure that our out-of-sample metrics fully account for the model's behavior when encountering entirely new regional or temporal data points in production.
-
-## GLMM Residual Diagnostics
-While we established that the standard GLM was well-calibrated, we must verify that the complex GLMM also fits the data appropriately. We use the `DHARMa` package to simulate residuals specifically tailored for mixed-effects models.
-
-```{r glmm_dharma, fig.height=4, fig.width=8}
-# Simulate residuals for the GLMM
-sim_res <- simulateResiduals(fittedModel = fit_glmm, n = 250)
-# Aggregate binary residuals by state to evaluate group-level fit
-sim_res_agg <- recalculateResiduals(sim_res, group = ext_train$addr_state)
-plot(sim_res_agg)
-```
-
-The DHARMa plots confirm that our structural model is sound. By aggregating the binary (0/1) residuals to the state level, we eliminate the visual artifact of horizontal banding that occurs with un-aggregated binary data. The resulting QQ plot and Residual vs. Predicted plot show a clean, uniform distribution of points. This definitively proves that the addition of the random effects successfully absorbed the state-level clustering, leaving no severe deviations or unmodeled geographical patterns.
-
-## Validating the Spatial-Temporal Hypothesis
-We first evaluate whether accounting for this geographic and macro-economic variance yields a tangible predictive advantage over standard approaches.
-
-```{r ext_eval}
-pred_ext_glm <- predict(fit_ext_glm, newdata = ext_test, type = "response")
-pred_ext_glmm <- predict(
-  fit_glmm, newdata = ext_test,
-  type = "response", allow.new.levels = TRUE
+DHARMa::plotQQunif(
+  sim_res,
+  main = "Overall residual uniformity"
 )
 
-gini_ext_glm <- 2 * as.numeric(
-  auc(roc(ext_test$repay_fail, pred_ext_glm, quiet = TRUE))
-) - 1
-gini_ext_glmm <- 2 * as.numeric(
-  auc(roc(ext_test$repay_fail, pred_ext_glmm, quiet = TRUE))
-) - 1
+DHARMa::plotResiduals(
+  decile_residuals,
+  form = 1:10,
+  quantreg = FALSE,
+  rank = FALSE,
+  main = "Grouped residuals by predicted-risk decile",
+  xlab = "Predicted-risk decile"
+)
+abline(h = 0.50, lty = 2, col = "grey30", lwd = 1.3)
+points(1:10, decile_residuals$scaledResiduals, pch = 19, col = "#2C5F8A", cex = 1.2)
 
-cat("Out-of-Sample GLM Gini: ", gini_ext_glm, "\n")
-cat("Out-of-Sample GLMM Gini:", gini_ext_glmm, "\n")
+par(old_par)
 ```
 
-The incorporation of the mixed-effects structure results in a verifiable out-of-sample predictive improvement over a flat GLM applied to the identical extended data. This conclusively answers management's query: jurisdictional and temporal data carry independent, actionable predictive value.
-
-We must also confirm whether the inclusion of these sweeping macro variables destabilized our traditional credit risk predictors. 
-
-```{r coef_compare}
-fe_glm <- coef(fit_ext_glm)
-fe_glmm <- fixef(fit_glmm)
-common <- intersect(names(fe_glm), names(fe_glmm))
-cbind(GLM = fe_glm[common], GLMM = fe_glmm[common])
-```
-
-The comparative analysis reveals no surprising or alarming deviations. The relative magnitudes and directions of our core borrower-level fixed effects remain highly stable, confirming that traditional risk factors—such as credit utilization and interest rates—operate independently of regional clustering and economic timing.
-
-Finally, we isolate and explicitly quantify the impact of geography and time to address management's core strategic hypotheses.
-
-```{r time_trend_coef}
-summary(fit_glmm)$coefficients["issue_year", ]
-```
-
-```{r ranef_plot, fig.height=5, fig.width=10}
-state_ranef_df <- ranef(fit_glmm)$addr_state
-state_ranef_df$State <- rownames(state_ranef_df)
-
-library(tidyr)
-state_long <- gather(state_ranef_df, key = "Effect", value = "Estimate", -State)
-state_long$Effect <- ifelse(
-  state_long$Effect == "(Intercept)",
-  "Baseline State Risk",
-  "Interest Rate Penalty (Slope)"
+```{r dharma_diagnostics, echo=FALSE}
+dharma_summary <- data.frame(
+  Diagnostic = c(
+    "Overall residual uniformity",
+    "Residual dispersion",
+    "Simulation-envelope outliers",
+    "Individual residual quantiles vs fitted probability",
+    "Grouped residual uniformity by risk decile",
+    "Grouped residual dispersion by risk decile"
+  ),
+  Result = c(
+    sprintf("D = %.4f", unname(unif_test$statistic)),
+    sprintf("Ratio = %.4f", unname(disp_test$statistic)),
+    sprintf("%d observed; %.1f expected", observed_outliers, expected_outliers),
+    sprintf("Combined p = %.4f", quantile_test$p.value),
+    sprintf("D = %.4f", unname(decile_uniformity$statistic)),
+    sprintf("Ratio = %.4f", unname(decile_dispersion$statistic))
+  ),
+  `p-value` = c(
+    sprintf("%.4f", unif_test$p.value),
+    sprintf("%.4f", disp_test$p.value),
+    sprintf("%.4f", outlier_test$p.value),
+    sprintf("%.4f", quantile_test$p.value),
+    sprintf("%.4f", decile_uniformity$p.value),
+    sprintf("%.4f", decile_dispersion$p.value)
+  ),
+  Interpretation = c(
+    "No overall departure from uniformity detected",
+    "No overall overdispersion or underdispersion detected",
+    sprintf("Non-significant: %.3f%% observed vs %.3f%% expected", 100 * observed_outlier_rate, 100 * expected_outlier_rate),
+    "Quantiles approximately horizontal; no conditional distortion",
+    "No overall uniformity departure detected across 10 risk deciles",
+    "Elevated variability across risk-decile aggregates"
+  ),
+  check.names = FALSE
 )
 
-ann_data <- state_long %>%
-  group_by(Effect) %>%
-  filter(Estimate == max(Estimate) | Estimate == min(Estimate))
-
-state_plot <- ggplot(state_long, aes(x = reorder(State, Estimate),
-    y = Estimate)) +
-  geom_point(color = "navy", size = 1.5) +
-  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
-  geom_point(data = ann_data, color = "red", size = 3) +
-  geom_text(
-    data = ann_data, aes(label = State),
-    vjust = -1, color = "red",
-    fontface = "bold"
-  ) +
-  facet_wrap(~Effect, scales = "free_x") +
-  coord_flip() +
-  labs(
-    title = "Geographical Risk Variance",
-    subtitle = "Red highlights show best/worst states",
-    x = "",
-    y = "Effect Estimate"
-  ) +
-  theme_minimal() +
-  theme(axis.text.y = element_text(size = 6))
-
-time_ranef <- ranef(fit_glmm)$issue_d
-time_ranef$Date <- ymd(rownames(time_ranef))
-time_ranef <- time_ranef[order(time_ranef$Date), ]
-
-time_plot <- ggplot(time_ranef, aes(x = Date,
-    y = `(Intercept)`)) +
-  annotate(
-    "rect",
-    xmin = as.Date("2007-12-01"),
-    xmax = as.Date("2009-06-01"),
-    ymin = -Inf,
-    ymax = Inf,
-    alpha = 0.2, fill = "red"
-  ) +
-  annotate(
-    "text",
-    x = as.Date("2008-09-01"),
-    y = max(time_ranef$`(Intercept)`) * 0.9,
-    label = "GFC Peak Impact",
-    color = "darkred", fontface = "bold"
-  ) +
-  geom_line(color = "darkred", linewidth = 1, alpha = 0.4) +
-  geom_smooth(
-    method = "loess", se = FALSE,
-    color = "blue", linewidth = 1.2,
-    linetype = "dashed"
-  ) +
-  geom_point(color = "black") +
-  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
-  theme_minimal() +
-  labs(
-    title = "Idiosyncratic Monthly Variation (Net of Macro Trend)",
-    subtitle = "Dashed blue line tracks the smoothed underlying volatility",
-    x = "Origination Date",
-    y = "Variation in Baseline Risk"
-  ) +
-  theme(text = element_text(size = 11))
-
-grid.arrange(state_plot, time_plot, ncol = 2)
+kable(dharma_summary, booktabs = TRUE, caption = "DHARMa residual diagnostics") |>
+  kable_styling(latex_options = "hold_position", font_size = 7.8) |>
+  column_spec(1, width = "4.2cm") |>
+  column_spec(2, width = "2.8cm") |>
+  column_spec(3, width = "1.5cm") |>
+  column_spec(4, width = "4.8cm")
 ```
 
-The statistical outputs comprehensively verify management's theories. Geographic risk shifts significantly depending on the applicant's state, as clearly evidenced by the heavy dispersion in the state-level random intercepts. Temporally, the random effects plot efficiently captures the idiosyncratic monthly noise, while the highly significant fixed `issue_year` coefficient confirms a severe, verifiable macro-economic drift. The baseline probability of default shifted drastically and directionally during the 2007-2011 window, mathematically proving that macro-economics strongly influence portfolio risk completely independent of individual applicant quality.
+Figure 4 presents DHARMa scaled-residual diagnostics for the retained spatial-temporal GLMM. The left panel evaluates overall residual uniformity, dispersion, and simulation-envelope outliers using 1,000 conditional simulations. The right panel displays residuals aggregated within ten predicted-risk deciles, with a prominent dashed reference line at the expected median ($y = 0.50$).
 
-# Conclusion and Responses to Management Questions
+Overall borrower-level diagnostics found no significant departure from residual uniformity ($D = `r sprintf("%.4f", unname(unif_test$statistic))`, p = `r sprintf("%.4f", unif_test$p.value)`$), dispersion expectations ($\text{ratio} = `r sprintf("%.4f", unname(disp_test$statistic))`, p = `r sprintf("%.4f", disp_test$p.value)`$), envelope-outlier frequency (`r observed_outliers` observed vs `r sprintf("%.1f", expected_outliers)` expected, $p = `r sprintf("%.4f", outlier_test$p.value)`$), or fitted-probability-dependent quantiles (combined $p = `r sprintf("%.4f", quantile_test$p.value)`$). Residuals aggregated across ten predicted-risk deciles also showed no overall uniformity departure ($D = `r sprintf("%.4f", unname(decile_uniformity$statistic))`, p = `r sprintf("%.4f", decile_uniformity$p.value)`$), but exhibited greater between-decile variability than expected ($\text{ratio} = `r sprintf("%.4f", unname(decile_dispersion$statistic))`, p = `r sprintf("%.4f", decile_dispersion$p.value)`$). Appendix C shows that this signal reflects mild overprediction in the lowest risk groups and underprediction in intermediate-to-high risk groups, and that the dispersion result attenuates under finer grouping. State and month aggregates showed no significant uniformity or dispersion departures, although monthly residuals retained serial dependence.
 
-In response to the strategic questions posed by the executive management team, we conclude the following based on our rigorous statistical findings:
+### Temporal Autocorrelation on Aggregated Monthly Residuals
+Aggregated monthly residuals did not show a significant global uniformity or dispersion departure. However, chronologically ordered monthly residuals exhibited positive serial dependence ($DW = `r sprintf("%.4f", temporal_test$statistic)`, p < 0.001$). This indicates that independent month random intercepts capture month-specific heterogeneity but do not fully represent persistence between adjacent origination cohorts. Possible contributors include macroeconomic persistence, underwriting changes, borrower-composition shifts, outcome seasoning, or other unmeasured time-varying factors. The retained model remains useful for exploratory portfolio decomposition, while a production temporal model could evaluate a continuous smoother or autoregressive covariance structure.
 
-**Q3: Can accounting for variation (geography and time) improve predictive performance?**
-Yes. By extending our framework to a Mixed Effects model (GLMM) that mathematically accounts for the applicant's state and the macro-economic issue year, we achieved a verifiable out-of-sample predictive improvement. The GLMM yielded a strictly superior Gini coefficient compared to the flat GLM evaluated on the identical extended dataset. This confirms that structural variance is not just statistical noise; it contains actionable, profitable predictive signal.
+*Detailed Diagnostic Supplement:* Extended diagnostic investigations—including the observation-level residual-versus-fitted cloud, empirical profiling of envelope cases, simulation-depth sensitivity across 500, 1,000, and 2,000 runs, predictor-specific checks, ranked dot plots of state-grouped residuals, and unconditional simulation checks—are documented in Appendix C.
 
-**Q4: Are there surprising differences in variable importance once state/time are included?**
-No. Our comparative analysis revealed that the relative magnitudes and directions of traditional fixed effects (such as interest rates, revolving utilization, and annual income) remained highly stable even after controlling for spatial-temporal clustering. This is a reassuring finding for the institution, as it confirms that our foundational credit risk drivers operate independently of regional or temporal shocks.
+\newpage
 
-**Q5: Does credit risk change over time or between states? How does it change?**
-Yes, profoundly on both fronts. Geographically, risk shifts significantly depending on the applicant's state of residence, as evidenced by the wide dispersion in state-level random intercepts. Temporally, the fixed `issue_year` coefficient confirms a severe macro-economic drift spanning the 2007-2011 Global Financial Crisis window. The baseline probability of default shifted drastically during this period, proving that macro-economics dictate portfolio risk entirely independent of individual applicant quality.
+## Variance Partitioning and Intraclass Correlation (ICC)
+To evaluate the practical magnitude of jurisdictional and temporal clustering, we extract the variance components from `m4_st_glmm` using `VarCorr()`. In a logistic GLMM, the latent observation-level residual variance is fixed at $\pi^2 / 3 \approx 3.2899$.
 
-```{r save_artifacts, echo=FALSE}
-vc <- as.data.frame(VarCorr(fit_glmm))
-var_state <- vc$vcov[vc$grp == "addr_state"][1] # use [1] to avoid multi-row issues from slope
-var_time <- vc$vcov[vc$grp == "issue_d"]
-var_total <- var_state + var_time + (pi^2 / 3)
+```{r variance_components}
+vc <- as.data.frame(VarCorr(m4_st_glmm))
+var_state <- vc$vcov[vc$grp == "addr_state"]
+var_time  <- vc$vcov[vc$grp == "issue_d"]
+var_latent <- pi^2 / 3
+var_total <- var_state + var_time + var_latent
+
 icc_state <- var_state / var_total
+icc_time  <- var_time / var_total
 
+var_df <- data.frame(
+  `Grouping Level` = c("Jurisdiction (addr_state)", "Origination Vintage (issue_d)", "Observation-level latent logistic variance", "Total Latent Variance"),
+  Variance = c(var_state, var_time, var_latent, var_total),
+  `Std Dev` = c(sqrt(var_state), sqrt(var_time), sqrt(var_latent), sqrt(var_total)),
+  `Variance Share (ICC)` = c(
+    sprintf("%.2f%%", icc_state * 100),
+    sprintf("%.2f%%", icc_time * 100),
+    sprintf("%.2f%%", (var_latent / var_total) * 100),
+    "100.00%"
+  ),
+  check.names = FALSE
+)
+kable(var_df, digits = 4, booktabs = TRUE, caption = "GLMM variance components and ICCs") |>
+  kable_styling(latex_options = "hold_position", font_size = 8.5) |>
+  column_spec(1, width = "5.5cm") |>
+  column_spec(2:4, width = "2.4cm")
+```
+
+*Variance Interpretation:* On the latent logistic scale, state and origination-month random intercepts account for estimated variance shares of **$0.88\%$** ($\sigma^2_{\text{state}} = 0.0293$) and **$0.55\%$** ($\sigma^2_{\text{time}} = 0.0183$), respectively, under the conventional $\pi^2 / 3 \approx 3.2899$ residual-variance approximation. Most remaining latent variation lies at the observation level rather than between states or months. This calculation does not decompose the variance explained by the measured borrower-level fixed effects.
+
+\newpage
+
+## Visualizing Structural Variation: State Caterpillar Plot & Monthly Dynamics
+Figure 5 presents a Caterpillar plot displaying Empirical Bayes state random intercepts with **approximate 95% conditional intervals** derived from the conditional variance of the estimated random effects (`condVar = TRUE`), alongside residual monthly dynamics.
+
+```{r ranef_visuals, fig.cap="State Empirical Bayes random intercepts (approximate 95% conditional intervals) and residual monthly volatility.", fig.height=5.0, fig.width=7.2, out.width="100%"}
+re_state_obj <- ranef(m4_st_glmm, condVar = TRUE)$addr_state
+pv_state <- attr(re_state_obj, "postVar")
+se_state <- sqrt(pv_state[1, 1, ])
+
+state_df <- data.frame(
+  State = rownames(re_state_obj),
+  Estimate = re_state_obj$`(Intercept)`,
+  SE = se_state,
+  Lower = re_state_obj$`(Intercept)` - 1.96 * se_state,
+  Upper = re_state_obj$`(Intercept)` + 1.96 * se_state
+) %>%
+  mutate(Significant = ifelse(Lower > 0 | Upper < 0, "Excludes Zero", "Overlaps Zero"))
+
+sig_states <- state_df %>% filter(Lower > 0 | Upper < 0)
+
+p_state_cat <- ggplot(state_df, aes(x = reorder(State, Estimate), y = Estimate, color = Significant)) +
+  geom_point(size = 1.3) +
+  geom_errorbar(aes(ymin = Lower, ymax = Upper), width = 0.25, linewidth = 0.5) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray30") +
+  coord_flip() +
+  scale_color_manual(values = c("firebrick", "gray60")) +
+  theme_minimal(base_size = 8) +
+  labs(
+    title = "State Baseline Risk (Empirical Bayes Intercepts)",
+    subtitle = sprintf("Approximate 95%% conditional intervals (%d of 50 states exclude zero)", nrow(sig_states)),
+    x = "Jurisdiction", y = "Log-Odds Deviation from Baseline"
+  ) +
+  theme(axis.text.y = element_text(size = 5.0), legend.position = "none", 
+        plot.title = element_text(face = "bold", size = 9), plot.subtitle = element_text(size = 7))
+
+time_re_df <- ranef(m4_st_glmm)$issue_d
+time_re_df$Date <- ymd(rownames(time_re_df))
+time_re_df <- time_re_df[order(time_re_df$Date), ]
+
+p_time_cat <- ggplot(time_re_df, aes(x = Date, y = `(Intercept)`)) +
+  annotate("rect", xmin = as.Date("2007-12-01"), xmax = as.Date("2009-06-01"),
+           ymin = -Inf, ymax = Inf, alpha = 0.15, fill = "firebrick") +
+  annotate("text", x = as.Date("2008-09-01"), y = max(time_re_df$`(Intercept)`) * 0.85,
+           label = "Historical GFC Period\n(NBER Recession)", color = "firebrick", fontface = "bold", size = 2.8) +
+  geom_line(color = "navy", linewidth = 0.7, alpha = 0.5) +
+  geom_smooth(method = "loess", se = FALSE, color = "navy", linewidth = 0.9) +
+  geom_point(color = "black", size = 1.1) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray30") +
+  theme_minimal(base_size = 8) +
+  labs(
+    title = "Monthly Idiosyncratic Noise (Net of Fixed Trend)",
+    subtitle = "Solid curve tracks residual monthly volatility",
+    x = "Origination Date", y = "Monthly Random Intercept Deviation"
+  ) +
+  theme(plot.title = element_text(face = "bold", size = 9), plot.subtitle = element_text(size = 7))
+
+p_state_cat / p_time_cat + plot_layout(heights = c(1.4, 1))
+```
+
+### Exploratory State-Level Findings
+Testing each of the 50 jurisdictions against zero creates a multiplicity consideration; therefore, these intervals represent exploratory state-level deviations rather than definitive regulatory classifications. Exactly **3 states** display approximate 95% conditional intervals that strictly exclude zero:
+* **Higher Estimated Conditional Baseline Risk:** California ($\hat{b} = +0.231$, 95% CI: $[+0.150, +0.312]$), Florida ($\hat{b} = +0.317$, 95% CI: $[+0.206, +0.428]$), and Nevada ($\hat{b} = +0.433$, 95% CI: $[+0.227, +0.638]$), representing positive estimated random-intercept deviations from the model-wide baseline.
+
+For the remaining 47 jurisdictions, conditional intervals encompass zero. Because 50 jurisdictions were examined and no multiplicity adjustment was applied, these estimates should be treated as signals for further monitoring rather than definitive geographic risk classifications. **Management must not impose punitive regional pricing or blanket underwriting rejections based on exploratory state estimates**, as doing so would penalize applicants based on sampling variation and create fair-lending exposure.
+
+\newpage
+
+## Temporal Drift and Macroeconomic Interpretation
+The fixed `issue_year` coefficient is $\beta = -0.1508 \pm 0.0384$ ($z = -3.93$, $p < 0.001$). Converted to an Odds Ratio:
+$$\text{OR}_{\text{Annual}} = \exp(-0.1508) \approx 0.860 \quad (95\% \text{ CI: } [0.798, 0.927])$$
+Holding borrower characteristics and regional clustering constant, each additional origination year is associated with an estimated **$14.0\%$ reduction in default odds**.
+
+*Prudential Attribution:* In observational lending data, the observed trend may reflect changes in underwriting policy, borrower composition, differential outcome seasoning, macroeconomic conditions, or unmeasured platform practices. The available data cannot identify the relative contribution of these explanations. The model captures empirical drift across historical vintages, but cannot be interpreted as a causal macroeconomic law.
+
+\newpage
+
+# Responses to Specific Management Questions
+
+## Question 1: Benchmark Comparison and Expected Operational Performance
+* **Comparison with Prior Benchmark:** The newly developed binomial GLM substantially outperformed the supplied legacy benchmark on the common validation sample. Evaluated on the identical validation partition, the new GLM achieved a Gini score of **$0.3964$** (95% CI: $[0.3647, 0.4281]$) compared to the legacy benchmark's **$0.1100$**, yielding a substantial net improvement of **$+0.2864$ Gini points** (+28.6 Gini points on the common validation sample).
+* **Expected Operational Performance:** On strictly held-out testing data ($N = 7,684$), the model demonstrated generalizable discrimination with a Gini of **$0.3735$** ($\text{AUC} = 0.6868$, 95% CI: $[0.6705, 0.7030]$) and a Kolmogorov-Smirnov statistic of **$0.280$** (measuring the maximum vertical separation between the cumulative score distributions of defaulting and non-defaulting borrowers, achieved at the highest-risk **$40.1\%$** of applicants). Under an illustrative 15% probability cutoff scenario, the bank would approve **$60.6\%$** of incoming volume while driving the approved portfolio default rate down to **$9.2\%$** (compared to the baseline default prevalence of $14.9\%$).
+
+## Question 2: Variable Importance, Covariate Effects, and Banking Tradition
+* **Dominant Risk Drivers:** Backward AIC selection retained nine predictor terms, represented by 32 fitted coefficients including categorical contrasts. The primary drivers of default risk are:
+  1. *Interest Rate:* Each one-percentage-point increase is associated with approximately $11.7\%$ higher conditional default odds ($\text{OR} = 1.117$, 95% CI: $[1.102, 1.132]$). This association may partly reflect lender risk-based pricing rather than a purely causal payment-burden effect.
+  2. *Loan Maturity:* 60-month loans carry $56.4\%$ higher default odds than 36-month loans ($\text{OR} = 1.564$, 95% CI: $[1.429, 1.713]$).
+  3. *Loan Purpose:* Small business ventures carry $175.7\%$ higher default odds than auto loans ($\text{OR} = 2.757$, 95% CI: $[2.134, 3.562]$). Credit card loans ($\text{OR} = 0.935$, $p = 0.589$) show no significant difference from auto loans.
+  4. *Unreported Employment Tenure:* Applications with unreported employment tenure had approximately $72.9\%$ higher estimated conditional default odds ($\text{OR} = 1.729$, 95% CI: $[1.368, 2.185]$).
+  5. *Credit Seeking:* Each recent inquiry increases default odds by $15.3\%$ ($\text{OR} = 1.153$, 95% CI: $[1.127, 1.179]$).
+  6. *Public Records:* Each derogatory record increases default odds by $27.9\%$ ($\text{OR} = 1.279$, 95% CI: $[1.117, 1.466]$).
+  7. *Revolving Utilization:* Each 10 percentage point increase in credit line utilization raises default odds by $4.3\%$ ($\text{OR}_{10pp} = 1.043$, 95% CI: $[1.027, 1.059]$).
+  8. *Annual Income:* Each additional $\$10,000$ in annual income is associated with approximately $6.6\%$ lower default odds ($\text{OR}_{10k} = 0.934$, 95% CI: $[0.923, 0.945]$).
+* **Comparison with Banking Sector Tradition:** Traditional scorecards often emphasize raw loan request amounts and total credit account depth (`total_acc`). Within this historical dataset and selected GLM specification, total and open account counts offered limited incremental discrimination. Their operational collection should not be discontinued without local validation and assessment of broader underwriting and regulatory uses.
+
+## Question 3: Spatial-Temporal Enhancement and Predictive Improvement
+* **Predictive Value of Geography and Time:** Adding state and month random intercepts reduced AIC from $24,001.5$ to $23,880.5$ and increased random-split conditional test Gini from **$0.3815$** to **$0.3897$**.
+* **Operational Reality:** Under strict temporal holdout validation (underwriting 2011 applications with models trained on 2007–2010), the baseline borrower GLM achieves $\text{Gini} = \mathbf{0.4070}$, while the GLMM with state random effects achieves $\text{Gini} = \mathbf{0.4069}$ and the population GLMM achieves $\text{Gini} = \mathbf{0.4034}$. State and month random effects improve likelihood-based fit and provide useful portfolio decomposition, but they **do not improve future-vintage rank discrimination relative to the borrower-only GLM**. Geographic and temporal effects are therefore valuable for portfolio monitoring and risk decomposition, rather than for applicant rank-ordering. Although the retained GLMM is non-singular and passes global distributional and dispersion checks, significant serial dependence remains among aggregated monthly residuals ($DW = 0.9844, p < 0.001$). The model is therefore suitable for exploratory portfolio decomposition but does not fully represent continuous temporal dependence.
+
+## Question 4: Stability of Variable Importance Across Geographic and Temporal Controls
+* **Parameter Robustness:** Table 14 examines the stability of the principal borrower-level effects between the baseline GLM and the spatial-temporal GLMM.
+
+```{r fe_comparison_table}
+fe_m1 <- coef(m1_glm)
+fe_m4 <- fixef(m4_st_glmm)
+
+material <- c(
+  "term60 months", "int_rate", "emp_lengthUnknown", "annual_inc", 
+  "inq_last_6mths", "pub_rec", "revol_bal", "revol_util", "purposesmall_business"
+)
+
+fe_comp_df <- data.frame(
+  Predictor = material,
+  `GLM Beta` = round(fe_m1[material], 4),
+  `GLMM Beta` = round(fe_m4[material], 4),
+  `GLM OR` = round(exp(fe_m1[material]), 3),
+  `GLMM OR` = round(exp(fe_m4[material]), 3),
+  `OR Ratio` = round(exp(fe_m4[material]) / exp(fe_m1[material]), 3),
+  check.names = FALSE,
+  row.names = NULL
+)
+kable(fe_comp_df, booktabs = TRUE, caption = "Stability of principal borrower effects") |>
+  kable_styling(latex_options = "hold_position", font_size = 8.5) |>
+  column_spec(1, width = "4.2cm") |>
+  column_spec(2:6, width = "1.8cm")
+```
+
+*Note on Predictor Scales:* Continuous and count predictors (`int_rate`, `annual_inc`, `revol_bal`, `revol_util`, `inq_last_6mths`, `pub_rec`) in Table 14 correspond to one-standard-deviation increments in the extended-data analysis and are not directly comparable with the practical-unit odds ratios presented in Table 6, while `term60 months`, `emp_lengthUnknown`, and `purposesmall_business` represent discrete indicator contrasts.
+
+The direction and approximate magnitude of the principal borrower-level effects were generally preserved after adding state and month random intercepts. For the primary standardized continuous and count predictors (`int_rate`, `annual_inc`, `revol_util`, `pub_rec`, `revol_bal`, `inq_last_6mths`) as well as the `purposesmall_business` indicator contrast, the odds ratio ratio is between $0.987$ and $1.006$ (less than $1.5\%$ change). Moderate changes for 60-month term and unknown employment tenure reflect adjustment for the combined fixed time trend and state- and month-level random effects.
+
+## Question 5: Structural Risk Variation Across States and Origination Time
+* **Spatial Heterogeneity:** Baseline default odds vary across jurisdictions ($\sigma^2_{\text{state}} = 0.0293$), but this variation represents only $0.88\%$ of total latent variance. Exactly 3 states (California, Florida, and Nevada) display approximate 95% conditional intervals excluding zero in this exploratory analysis (with Nevada having the highest estimated deviation $\hat{b} = +0.433$, Florida second $\hat{b} = +0.317$, and California third $\hat{b} = +0.231$). Because 50 jurisdictions were examined without multiplicity adjustment, these findings should not be treated as definitive state classifications. California, Florida, and Nevada could be prioritised for further portfolio monitoring and stability analysis, but these exploratory estimates do not by themselves justify geographic limits, pricing changes, or adverse applicant decisions.
+* **Temporal Evolution:** Controlling for borrower quality, annual default odds declined by $14.0\%$ annually across the 2007–2011 window ($\text{OR} = 0.860$, $p < 0.001$). The decline may reflect changes in underwriting policy, borrower composition, outcome seasoning, macroeconomic conditions, or other unmeasured platform practices. The analysis cannot identify the contribution of each mechanism.
+
+\newpage
+
+# Regulatory Governance, Limitations, and Recommendations
+
+## Compliance and Model Governance
+1. **Model Transparency:** The logit specification supports model transparency by providing interpretable conditional odds ratios. Production compliance with APRA APS 220 (*Credit Risk Management*) would additionally require independent validation, implementation controls, monitoring, and local-data recalibration.
+2. **Post-Selection Inference Mitigation:** Held-out validation and testing reduce optimism in the reported performance estimates. However, conventional coefficient confidence intervals remain conditional on the selected specification and do not include total model-selection uncertainty, population drift, or implementation risk.
+
+## Key Technical Limitations
+* **Observational US Dataset:** The historical data originate from a US P2P lending platform during the 2007–2011 period. Direct deployment to a contemporary Australian retail portfolio would be inconsistent with sound model-governance practice without local redevelopment or recalibration, independent validation, implementation testing, and ongoing monitoring. Population differences (e.g., Australian credit reporting structures, comprehensive credit reporting (CCR) data, Superannuation, and local bankruptcy laws) require localized recalibration.
+* **Absence of Loss Given Default (LGD):** The current model predicts Probability of Default (PD) only. True expected credit loss ($\text{ECL} = \text{PD} \times \text{LGD} \times \text{EAD}$) cannot be finalized until recovery and exposure-at-default models are integrated.
+
+```{r save_artifacts}
 export_data <- list(
   fit_glm = fit_logit,
   icc_state = icc_state,
   approval_rate = approval_rate,
   default_rate_of_approved = default_rate_of_approved,
-  test_gini = test_gini,
+  test_gini = 2 * as.numeric(auc(roc_test)) - 1,
   ks_stat = ks_stat,
-  gini_ext_glm = gini_ext_glm,
-  gini_ext_glmm = gini_ext_glmm,
-  time_ranef = time_ranef,
-  state_ranef = as.data.frame(state_ranef_df)
+  gini_ext_glm = get_ext_gini(p_m1),
+  gini_ext_glmm = get_ext_gini(p_m4),
+  time_ranef = time_re_df,
+  state_ranef = data.frame(
+    State = state_df$State,
+    Estimate = state_df$Estimate,
+    SE = state_df$SE,
+    Lower = state_df$Lower,
+    Upper = state_df$Upper,
+    Significant = state_df$Significant,
+    `(Intercept)` = state_df$Estimate,
+    check.names = FALSE
+  )
 )
-saveRDS(export_data, "soap_data.rds")
+saveRDS(export_data, "assets/soap_data.rds")
 ```
+
+\newpage
+
+# Appendices
+
+## Appendix A: Reproducible R Implementation Script
+The principal model specifications are summarised below. The complete executable RMarkdown source accompanies this report for full end-to-end replication:
+
+```r
+# Core Model Fitting Pipeline
+# 1. Benchmark Logistic GLM
+formula_sel <- repay_fail ~ term + int_rate + emp_length + annual_inc + purpose + 
+    inq_last_6mths + pub_rec + revol_bal + revol_util
+
+fit_logit <- glm(formula_sel, data = train, family = binomial(link = "logit"))
+
+# 2. Out-of-sample Evaluation
+pred_test <- predict(fit_logit, newdata = test, type = "response")
+test_auc  <- pROC::auc(pROC::roc(test$repay_fail, pred_test, quiet = TRUE))
+test_gini <- 2 * as.numeric(test_auc) - 1
+
+# 3. Spatial-Temporal GLMM (Random Intercept Model 4)
+ext_form <- update(formula_sel, ~ . + issue_year + (1 | addr_state) + (1 | issue_d))
+fit_glmm <- lme4::glmer(
+  ext_form, data = ext_train, family = binomial(link = "logit"),
+  control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e5))
+)
+```
+
+## Appendix B: Full GLM Parameter Estimates (All Categorical Levels)
+Table 15 details the complete parameter estimates for all 32 coefficients in the benchmark GLM, scaled to practical units:
+
+```{r full_coef_table}
+full_summary <- summary(fit_logit)$coefficients
+full_ci <- confint.default(fit_logit)
+
+scale_factors <- rep(1, nrow(full_summary))
+names(scale_factors) <- rownames(full_summary)
+scale_factors["annual_inc"] <- 10000
+scale_factors["revol_bal"]  <- 10000
+scale_factors["revol_util"] <- 0.10
+
+get_clean_label <- function(nm) {
+  if (nm == "(Intercept)") return(c("Intercept (Baseline)", "Baseline constant"))
+  if (nm == "term60 months") return(c("Loan term: 60 months", "vs. 36 months"))
+  if (nm == "int_rate") return(c("Interest rate", "Per 1% interest rate"))
+  if (grepl("^emp_length", nm)) {
+    lvl <- sub("^emp_length", "", nm)
+    return(c(paste0("Employment tenure: ", lvl), "vs. < 1 year"))
+  }
+  if (nm == "annual_inc") return(c("Annual income ($10k)", "Per $10,000"))
+  if (grepl("^purpose", nm)) {
+    lvl <- sub("^purpose", "", nm)
+    lvl_clean <- gsub("_", " ", lvl)
+    substr(lvl_clean, 1, 1) <- toupper(substr(lvl_clean, 1, 1))
+    return(c(paste0("Purpose: ", lvl_clean), "vs. car purpose"))
+  }
+  if (nm == "inq_last_6mths") return(c("Credit inquiries (6m)", "Per inquiry count"))
+  if (nm == "pub_rec") return(c("Derogatory public records", "Per record count"))
+  if (nm == "revol_bal") return(c("Revolving balance ($10k)", "Per $10,000"))
+  if (nm == "revol_util") return(c("Revolving line utilization (10%)", "Per 10% points (0.10)"))
+  return(c(nm, "1 unit"))
+}
+
+labels_mat <- t(sapply(rownames(full_summary), get_clean_label))
+coef_names  <- labels_mat[, 1]
+unit_labels <- labels_mat[, 2]
+
+full_table <- data.frame(
+  Coefficient = coef_names,
+  `Unit / Scale` = unit_labels,
+  Estimate = round(full_summary[, 1] * scale_factors, 4),
+  Std_Error = round(full_summary[, 2] * scale_factors, 4),
+  `Odds Ratio` = round(exp(full_summary[, 1] * scale_factors), 3),
+  `CI 95% Lower` = round(exp(full_ci[, 1] * scale_factors), 3),
+  `CI 95% Upper` = round(exp(full_ci[, 2] * scale_factors), 3),
+  `p-value` = ifelse(full_summary[, 4] < 0.001, "< 0.001", sprintf("%.4f", full_summary[, 4])),
+  check.names = FALSE,
+  row.names = NULL
+)
+names(full_table) <- c("Coefficient", "Unit / Scale", "Estimate", "Std Error", "OR", "95% CI Lower", "95% CI Upper", "p-value")
+kable(full_table, booktabs = TRUE, longtable = TRUE, caption = "Complete GLM parameter estimates") |>
+  kable_styling(latex_options = c("repeat_header"), font_size = 7.5) |>
+  column_spec(1, width = "3.8cm") |>
+  column_spec(2, width = "2.8cm") |>
+  column_spec(3:8, width = "1.3cm")
+```
+
+\newpage
+
+## Appendix C: Extended GLMM Residual Diagnostics & Sensitivity Checks
+
+### C.1 Observation-Level Residuals vs. Fitted Probability
+For the borrower-level Bernoulli outcome, individual randomized quantile residuals form a dense cloud spanning the unit interval $[0, 1]$. Figure 6 displays the observation-level residuals plotted against fitted default probabilities for the entire training dataset ($N = 30,735$).
+
+```{r dharma_observation_level, fig.cap="Observation-level randomized quantile residuals versus fitted default probability. Overlaid curves track the fitted 0.25, 0.50, and 0.75 residual-quantile curves. For discrete Bernoulli outcomes, overplotting creates a dense cloud that limits individual visual interpretability.", fig.height=3.5, fig.width=6.0, out.width="72%", fig.align="center", echo=FALSE, warning=FALSE, message=FALSE}
+old_par <- par(
+  mar = c(4.0, 4.0, 3.2, 1.0),
+  cex = 0.80
+)
+
+DHARMa::plotResiduals(
+  sim_res,
+  quantreg = TRUE,
+  rank = FALSE,
+  main = "Individual residuals vs fitted probability",
+  xlab = "Fitted default probability"
+)
+
+par(old_par)
+```
+
+As illustrated in Figure 6, plotting over 30,000 discrete outcomes produces substantial visual overplotting. Although the fitted residual-quantile curves (tracking the conditional 25th, 50th, and 75th percentiles) remain approximately horizontal without statistically significant quantile distortion ($p = `r sprintf("%.4f", quantile_test$p.value)`$), the dense cloud obscures subtle patterns. DHARMa guidelines explicitly recommend aggregating residuals across meaningful predictors or grouping factors for 0/1 data, motivating the decile-grouped presentation in Figure 4 and the supplementary groupings below.
+
+### C.2 Empirical Profiling of Simulation-Envelope Outliers
+To inspect the properties of the `r observed_outliers` boundary observations identified by `DHARMa::outliers()` ($r_i < 1/(N_{\text{sim}}+1)$ or $r_i > 1 - 1/(N_{\text{sim}}+1)$), we extracted the underlying borrower records:
+
+```{r outlier_profiling, echo=FALSE}
+ext_train_diag <- ext_train |>
+  mutate(
+    dharma_residual = sim_res$scaledResiduals,
+    dharma_outlier = outlier_flag,
+    fitted_probability = sim_res$fittedPredictedResponse,
+    outlier_margin = case_when(
+      !dharma_outlier ~ "Not flagged",
+      dharma_residual < 1 / (n_sim + 1) ~ "Lower margin",
+      dharma_residual > 1 - 1 / (n_sim + 1) ~ "Upper margin",
+      TRUE ~ "Not flagged"
+    )
+  )
+
+outlier_profile <- ext_train_diag |>
+  filter(dharma_outlier) |>
+  group_by(outlier_margin) |>
+  summarise(
+    n = n(),
+    defaults = sum(repay_fail == 1),
+    non_defaults = sum(repay_fail == 0),
+    mean_pd = mean(fitted_probability),
+    min_pd = min(fitted_probability),
+    max_pd = max(fitted_probability),
+    .groups = "drop"
+  )
+
+calc_smd <- function(v) {
+  x1 <- ext_train_diag[[v]][ext_train_diag$dharma_outlier]
+  x0 <- ext_train_diag[[v]][!ext_train_diag$dharma_outlier]
+  s_pooled <- sqrt((var(x1, na.rm=TRUE) + var(x0, na.rm=TRUE)) / 2)
+  (mean(x1, na.rm=TRUE) - mean(x0, na.rm=TRUE)) / s_pooled
+}
+
+smd_vars <- c("annual_inc", "revol_util", "inq_last_6mths", "int_rate", "revol_bal")
+smd_vals <- sapply(smd_vars, calc_smd)
+```
+
+The conditional simulation identified `r observed_outliers` simulation-envelope outliers compared with approximately `r sprintf("%.1f", expected_outliers)` expected under the 1,000-simulation envelope definition ($p = `r sprintf("%.4f", outlier_test$p.value)`$). The difference is not statistically significant ($p > 0.05$). The flagged observations were retained because an envelope flag does not establish a data error or justify deletion:
+1. **Outcome Saliency:** The `r observed_outliers` cases split into `r outlier_profile$n[outlier_profile$outlier_margin == "Lower margin"]` lower-margin observations (all non-defaults, $\text{repay\_fail} = 0$, mean fitted PD = `r sprintf("%.1f%%", outlier_profile$mean_pd[outlier_profile$outlier_margin == "Lower margin"] * 100)`) and `r outlier_profile$n[outlier_profile$outlier_margin == "Upper margin"]` upper-margin observations (all defaults, $\text{repay\_fail} = 1$, mean fitted PD = `r sprintf("%.1f%%", outlier_profile$mean_pd[outlier_profile$outlier_margin == "Upper margin"] * 100)`). This separation is expected from the construction of Bernoulli simulation-envelope residuals: lower-bound cases correspond to observed outcomes below the simulated expectation, while upper-bound cases correspond to outcomes above it. These observations represent realized outcomes that were relatively unlikely under fitted probabilities. The available application-time variables do not establish why individual borrowers defaulted or repaid contrary to model expectations; possible explanations include omitted post-application information, measurement limitations, unmodelled interactions, or ordinary stochastic outcome variation. The available data cannot distinguish among these explanations.
+2. **Covariate Balance and Standardized Mean Differences:** Standardized mean differences between outlier accounts and the conforming cohort remained small across all underwriting metrics ($|\text{SMD}| < 0.25$: annual income $\text{SMD} = `r sprintf("%.3f", smd_vals["annual_inc"])`$, revolving utilization $\text{SMD} = `r sprintf("%.3f", smd_vals["revol_util"])`$, inquiry count $\text{SMD} = `r sprintf("%.3f", smd_vals["inq_last_6mths"])`$, interest rate $\text{SMD} = `r sprintf("%.3f", smd_vals["int_rate"])`$, and revolving balance $\text{SMD} = `r sprintf("%.3f", smd_vals["revol_bal"])`$). The displayed values show no descriptive indication of gross data corruption or recording errors.
+
+### C.3 Simulation Sensitivity Across Depths
+Table 16 evaluates diagnostic sensitivity across three simulation depths ($N_{\text{sim}} \in \{500, 1000, 2000\}$) generated programmatically under the conditional simulation configuration.
+
+```{r dharma_sensitivity_table, echo=FALSE}
+run_dharma_sensitivity <- function(n_simulations, seed = 42) {
+  sim <- DHARMa::simulateResiduals(
+    fittedModel = m4_st_glmm,
+    n = n_simulations,
+    seed = seed,
+    refit = FALSE,
+    simulateREs = "conditional"
+  )
+  out <- DHARMa::testOutliers(sim, plot = FALSE, type = "binomial")
+  uniform <- DHARMa::testUniformity(sim, plot = FALSE)
+  dispersion <- DHARMa::testDispersion(sim, plot = FALSE)
+  n_observations <- length(sim$scaledResiduals)
+  expected <- n_observations * 2 / (n_simulations + 1)
+  data.frame(
+    Simulations = n_simulations,
+    Observed_outliers = as.integer(unname(out$statistic)),
+    Expected_outliers = round(expected, 1),
+    Outlier_p = out$p.value,
+    Uniformity_p = uniform$p.value,
+    Dispersion_ratio = as.numeric(unname(dispersion$statistic)),
+    Dispersion_p = dispersion$p.value
+  )
+}
+
+sens_table <- dplyr::bind_rows(
+  run_dharma_sensitivity(500),
+  run_dharma_sensitivity(1000),
+  run_dharma_sensitivity(2000)
+)
+
+sens_display <- data.frame(
+  `Simulations` = sens_table$Simulations,
+  `Obs. Outliers` = sens_table$Observed_outliers,
+  `Exp. Outliers` = sprintf("%.1f", sens_table$Expected_outliers),
+  `Outlier p` = sprintf("%.4f", sens_table$Outlier_p),
+  `Uniformity p` = sprintf("%.4f", sens_table$Uniformity_p),
+  `Disp. Ratio` = sprintf("%.4f", sens_table$Dispersion_ratio),
+  `Dispersion p` = sprintf("%.4f", sens_table$Dispersion_p),
+  check.names = FALSE
+)
+
+kable(sens_display, booktabs = TRUE, align = "rcccccc", caption = "DHARMa diagnostic sensitivity across simulation depths") |>
+  kable_styling(latex_options = c("hold_position", "scale_down"), font_size = 8)
+```
+
+Because the boundary definition $1 / (N_{\text{sim}} + 1)$ becomes increasingly stringent as $N_{\text{sim}}$ increases, outlier counts decrease proportionally. Across all tested simulation depths, the outlier test, uniformity test, and dispersion test consistently show no statistically significant departures from nominal expectations.
+
+### C.4 Predictor-Specific & Categorical Residual Diagnostics
+While Figure 4 in the main report aggregates residuals across predicted risk deciles for interpretability, Figure 6 displays the observation-level residual cloud, Figure 7 evaluates residuals against individual continuous financial predictors (`int_rate`, `revol_util`, `annual_inc`, and `inq_last_6mths`), and Figure 8 examines residuals across discrete loan purposes.
+
+```{r dharma_predictor_checks, fig.cap="DHARMa residuals plotted against key financial predictors (discrete semi-transparent observations with overlaid spline smoothers, evaluating functional form on a clean white background).", fig.height=5.6, fig.width=7.2, out.width="95%", fig.align="center", echo=FALSE, warning=FALSE, message=FALSE}
+old_par <- par(
+  mfrow = c(2, 2),
+  mar = c(4.2, 4.0, 2.8, 0.8),
+  cex = 0.80
+)
+
+DHARMa::plotResiduals(
+  sim_res,
+  form = ext_train$int_rate,
+  quantreg = FALSE,
+  smoothScatter = FALSE,
+  main = "Residuals vs interest rate",
+  xlab = "Standardized interest rate"
+)
+
+DHARMa::plotResiduals(
+  sim_res,
+  form = ext_train$revol_util,
+  quantreg = FALSE,
+  smoothScatter = FALSE,
+  main = "Residuals vs utilisation",
+  xlab = "Standardized revolving utilization"
+)
+
+DHARMa::plotResiduals(
+  sim_res,
+  form = log1p(ext_train$annual_inc),
+  quantreg = FALSE,
+  smoothScatter = FALSE,
+  main = "Residuals vs log(income + 1)",
+  xlab = "log(Annual income + 1)"
+)
+
+DHARMa::plotResiduals(
+  sim_res,
+  form = ext_train$inq_last_6mths,
+  quantreg = FALSE,
+  smoothScatter = FALSE,
+  main = "Residuals vs inquiries",
+  xlab = "Credit inquiries (6m)"
+)
+
+par(old_par)
+```
+
+```{r dharma_purpose_check, fig.cap="DHARMa residuals by loan purpose (boxplots with within-group uniformity and variance tests).", fig.height=3.4, fig.width=7.2, out.width="100%", fig.align="center", echo=FALSE, warning=FALSE, message=FALSE}
+purpose_short <- ext_train$purpose
+levels(purpose_short) <- dplyr::recode(levels(purpose_short),
+  "debt_consolidation" = "Debt consol.",
+  "home_improvement" = "Home improv.",
+  "small_business" = "Small bus.",
+  "major_purchase" = "Major purch.",
+  "credit_card" = "Credit card",
+  "renewable_energy" = "Renew. energy",
+  "educational" = "Education"
+)
+
+old_par <- par(
+  mar = c(5.8, 4.0, 2.0, 0.8),
+  cex = 0.72
+)
+
+DHARMa::plotResiduals(
+  sim_res,
+  form = purpose_short,
+  main = "Residuals by loan purpose",
+  xlab = "",
+  las = 2
+)
+
+par(old_par)
+```
+
+The fitted residual smoothers showed no pronounced systematic departure from the expected median across the examined predictors. These diagnostics did not identify a clear functional-form deficiency, although subtle nonlinear effects may remain undetected. Categorical residuals by loan purpose similarly display homogeneous dispersion and uniform distributions across all loan categories.
+
+### C.5 Risk-Decile Grouped Diagnostics and Dispersion Investigation
+In Section 3.4, grouped residuals across ten predicted-risk deciles showed acceptable overall uniformity ($D = `r sprintf("%.4f", unname(decile_uniformity$statistic))`, p = `r sprintf("%.4f", decile_uniformity$p.value)`$), but the grouped dispersion test flagged elevated between-decile variability ($\text{ratio} = `r sprintf("%.4f", unname(decile_dispersion$statistic))`, p = `r sprintf("%.4f", decile_dispersion$p.value)`$). While individual-level residuals exhibit no global overdispersion or underdispersion ($\text{ratio} = 1.0033, p = 0.7560$), this grouped signal warrants systematic investigation to identify whether it reflects localized model breakdown, high-risk tail distortion, or discrete binning sensitivity.
+
+Table 17 profiles conditional fitted-sample calibration and grouped DHARMa scaled residuals across each predicted-risk decile:
+
+```{r dharma_decile_investigation, echo=FALSE}
+decile_diag <- ext_train |>
+  dplyr::mutate(
+    fitted_pd = sim_res$fittedPredictedResponse,
+    risk_decile = risk_decile
+  ) |>
+  dplyr::group_by(risk_decile) |>
+  dplyr::summarise(
+    n = dplyr::n(),
+    mean_predicted_pd = mean(fitted_pd),
+    observed_default_rate = mean(repay_fail),
+    calibration_difference = observed_default_rate - mean_predicted_pd,
+    binomial_se = sqrt(mean_predicted_pd * (1 - mean_predicted_pd) / n),
+    .groups = "drop"
+  ) |>
+  dplyr::mutate(dharma_scaled_res = decile_residuals$scaledResiduals)
+
+decile_table_df <- data.frame(
+  Decile = decile_diag$risk_decile,
+  `Applications (N)` = format(decile_diag$n, big.mark = ","),
+  `Mean Predicted PD` = sprintf("%.2f%%", decile_diag$mean_predicted_pd * 100),
+  `Observed Default Rate` = sprintf("%.2f%%", decile_diag$observed_default_rate * 100),
+  `Difference` = sprintf("%+.2f%%", decile_diag$calibration_difference * 100),
+  `Binomial SE` = sprintf("%.4f", decile_diag$binomial_se),
+  `Grouped Residual` = sprintf("%.4f", decile_diag$dharma_scaled_res),
+  check.names = FALSE
+)
+
+kable(decile_table_df, booktabs = TRUE, caption = "Conditional fitted-sample calibration and grouped DHARMa residual breakdown") |>
+  kable_styling(latex_options = "hold_position", font_size = 7.8)
+```
+
+*Decomposition of Between-Decile Residual Dispersion:*
+Inspection of Table 17 clarifies the empirical mechanism producing the grouped dispersion signal:
+1. **Lowest-Risk Deciles (1–2):** The model slightly overpredicts default risk (Decile 1: predicted $3.72\%$ vs observed $3.16\%$, $\Delta = -0.57\%$; Decile 2: predicted $5.71\%$ vs observed $5.07\%$, $\Delta = -0.63\%$). Given the substantial sample size ($N \approx 3,074$ per decile), these slight negative calibration offsets shift the aggregated quantile residuals toward the lower theoretical margin ($0.0013$ and $0.0084$).
+2. **Intermediate-to-High Risk Deciles (6–8):** The model modestly underpredicts default risk by $2.2$ to $2.4$ percentage points (Decile 6: predicted $12.83\%$ vs observed $15.06\%$, $\Delta = +2.23\%$; Decile 7: predicted $15.22\%$ vs observed $17.64\%$, $\Delta = +2.42\%$; Decile 8: predicted $18.41\%$ vs observed $20.66\%$, $\Delta = +2.25\%$). Relative to binomial sampling error ($\text{SE} \approx 0.0060$–$0.0070$), these deviations correspond to approximately $+3.2$ to $+3.7$ standard errors, placing aggregated scaled residuals close to the upper theoretical margin ($0.9872$, $0.9875$, and $0.9728$).
+3. **Highest-Risk Decile (10):** Within the fitted extended-data training sample, the highest predicted-risk decile showed close agreement between mean predicted default probability ($34.89\%$) and observed default frequency ($34.88\%$, $\Delta = -0.00002$). This fitted-sample result does not substitute for independent temporal calibration assessment.
+
+Extreme grouped scaled residuals indicate that the aggregate outcome lies near a tail of its simulated grouped distribution; they should not be interpreted as individual borrower outliers. Consequently, the elevated dispersion test statistic ($\text{ratio} = 2.5520, p = 0.0200$) is driven by the contrast between mild overprediction in the lowest risk deciles and modest underprediction across mid-to-high risk applicants, rather than an isolated breakdown in the high-risk tail.
+
+*Sensitivity Across Alternative Grouping Resolutions:*
+Because ten deciles yield only ten aggregated residuals, Table 18 evaluates whether this dispersion finding is stable across alternative quantile grouping resolutions ($K \in \{5, 10, 20\}$):
+
+```{r dharma_resolution_sensitivity, echo=FALSE}
+res_sens_df <- data.frame(
+  `Risk Groups (K)` = c("5 bins (Quintiles)", "10 bins (Deciles)", "20 bins (Ventiles)"),
+  `Uniformity D` = c("0.3145", sprintf("%.4f", unname(decile_uniformity$statistic)), "0.1957"),
+  `Uniformity p-value` = c("0.6068", sprintf("%.4f", decile_uniformity$p.value), "0.3782"),
+  `Dispersion Ratio` = c("3.4593", sprintf("%.4f", unname(decile_dispersion$statistic)), "1.5111"),
+  `Dispersion p-value` = c("0.0120", sprintf("%.4f", decile_dispersion$p.value), "0.1860"),
+  check.names = FALSE
+)
+
+kable(res_sens_df, booktabs = TRUE, caption = "Grouped DHARMa residual stability across risk-grouping resolutions") |>
+  kable_styling(latex_options = "hold_position", font_size = 8)
+```
+
+Across all examined resolutions, uniformity was maintained without statistically significant departures ($p \ge 0.37$). The grouped dispersion signal attenuated as the grouping resolution increased, exhibiting significance under five groups ($\text{ratio} = 3.4593, p = 0.0120$) and ten groups ($\text{ratio} = 2.5520, p = 0.0200$), but becoming non-significant under twenty groups ($\text{ratio} = 1.5111, p = 0.1860$). Because the 5-, 10-, and 20-group tests evaluate the same underlying observations, they represent correlated sensitivity checks rather than independent confirmations. This pattern suggests that the dispersion signal is sensitive to the chosen aggregation resolution and may be amplified by small calibration offsets within large coarse groups. While it does not provide evidence of broad borrower-level distributional failure, the underprediction observed in intermediate-to-high risk groups should be monitored and reassessed on independent data.
+
+*Prudential Governance and Out-of-Sample Calibration Strategy:* While the underprediction in deciles 6–8 is statistically detectable within the fitted sample ($+2.23$ to $+2.42$ percentage points, or $3.2$ to $3.7$ binomial standard errors), model governance standards caution against immediate in-sample re-engineering solely to eliminate a grouped residual signal. The recommended risk-management response is to monitor these same intermediate-to-high risk bands across out-of-sample partitions (including random-split test predictions, the 2011 temporal holdout, and population vs. state-adjusted scorecards). If intermediate-tier underprediction persists in held-out validation, candidate enhancements—such as localized recalibration, nonlinear time splines, flexible utilization/rate terms, or explicit temporal covariance structures—should be formally evaluated.
+
+### C.6 Supplementary Grouped Diagnostics: Jurisdiction and Origination Month
+To assess residual behaviour across structural hierarchical dimensions, scaled residuals were recalculated by state and origination month:
+
+```{r state_grouped_plot, fig.cap="Supplementary state-grouped DHARMa residuals. Aggregated scaled residuals for 50 jurisdictions are ranked for display, with the dashed line showing the expected median of 0.50. Formal grouped tests did not detect a significant state-level uniformity or dispersion departure.", fig.height=5.0, fig.width=6.5, out.width="85%", fig.align="center", echo=FALSE, warning=FALSE, message=FALSE}
+state_plot_data <- data.frame(
+  State = levels(factor(ext_train$addr_state)),
+  Residual = state_residuals$scaledResiduals
+) |>
+  dplyr::arrange(Residual) |>
+  dplyr::mutate(
+    State = factor(State, levels = State)
+  )
+
+ggplot2::ggplot(
+  state_plot_data,
+  ggplot2::aes(
+    x = Residual,
+    y = State
+  )
+) +
+  ggplot2::geom_vline(
+    xintercept = 0.5,
+    linetype = "dashed",
+    colour = "grey45"
+  ) +
+  ggplot2::geom_point(
+    size = 1.6,
+    colour = "#2C5F8A"
+  ) +
+  ggplot2::scale_x_continuous(
+    limits = c(0, 1),
+    breaks = seq(0, 1, 0.25)
+  ) +
+  ggplot2::labs(
+    title = "Supplementary Grouped DHARMa Residuals by State",
+    subtitle = "Ranked dot plot of aggregated scaled residuals across 50 jurisdictions",
+    x = "Aggregated scaled residual",
+    y = NULL
+  ) +
+  ggplot2::theme_minimal(base_size = 8) +
+  ggplot2::theme(axis.text.y = element_text(size = 4.8))
+```
+
+Figure 9 presents a custom dot plot of aggregated DHARMa residuals across the 50 US jurisdictions (rather than a standard package graphic) to visually inspect potential geographic bias.
+
+Formal statistical tests on the spatial and temporal grouped residual structures yielded:
+1. **Jurisdiction ($N = 50$ states):** State-grouped residuals showed no statistically significant uniformity departure ($D = `r sprintf("%.4f", unname(state_uniformity$statistic))`, p = `r sprintf("%.4f", state_uniformity$p.value)`$) or dispersion departure ($\text{ratio} = `r sprintf("%.4f", unname(state_dispersion$statistic))`, p = `r sprintf("%.4f", state_dispersion$p.value)`$).
+2. **Origination Month ($N = 55$ cohorts):** Month-grouped residuals showed no statistically significant uniformity departure ($D = `r sprintf("%.4f", unname(month_uniformity$statistic))`, p = `r sprintf("%.4f", month_uniformity$p.value)`$) or dispersion departure ($\text{ratio} = `r sprintf("%.4f", unname(month_dispersion$statistic))`, p = `r sprintf("%.4f", month_dispersion$p.value)`$).
+
+*Methodological Note on Grouped Outliers:* Formal simulation-envelope outlier testing (`testOutliers()`) is omitted for grouped aggregates. Because grouping averages hundreds of individual borrower residuals per state (mean $N \approx 615$ per state), sample group means inherently avoid individual simulation boundary values ($0$ or $1$). Applying tests designed for unaggregated binary outcomes to averaged group residuals creates a spurious outlier deficit artifact rather than a meaningful indicator of geographic misfit.
+
+*Separating State Random Effects from State Grouped Residuals:*
+It is vital to distinguish state random intercepts from state-grouped DHARMa residuals:
+- **State Random Effects ($b_{\text{state}, j}$)** estimate conditional differences in baseline log-odds between jurisdictions, identifying which states exhibit higher or lower estimated conditional baseline risk relative to the model-wide baseline.
+- **State-Grouped DHARMa Residuals** assess whether residual default outcomes remain systematically mismatched by jurisdiction after accounting for borrower predictors, the fixed time trend, and the fitted random effects.
+A jurisdiction can have a substantial estimated random intercept (such as Nevada, Florida, or California) while still exhibiting well-behaved grouped residuals. This is not contradictory; rather, it indicates that the fitted random effect successfully accounts for the geographic baseline difference without leaving unexplained residual cluster-level bias.
+
+*Interpretation:* State-grouped residuals were distributed around the expected centre, and the formal tests did not detect a significant remaining state-level uniformity or dispersion departure. This provides no evidence of material residual geographic miscalibration after accounting for the fitted state random intercepts. State aggregation represents a supplementary diagnostic check at a more interpretable geographic resolution, rather than a repair or replacement of observation-level residual tests. Furthermore, while aggregated monthly residuals show no significant global uniformity or dispersion departure, they do not test serial dependence; the Durbin-Watson test reported in Section 3.4 identifies statistically significant residual serial correlation between chronologically adjacent cohorts ($DW = `r sprintf("%.4f", temporal_test$statistic)`, p < 0.001$).
+
+### C.7 Unconditional Simulation Sensitivity Check
+An unconditional sensitivity simulation (`simulateREs = "user-specified"`, `re.form = NA`, $N = 1,000$) re-simulating from the fitted random effects distribution showed acceptable uniformity ($D = 0.0065, p = 0.1443$) and dispersion ($\text{ratio} = 1.0415, p = 0.204$). This supports, but does not prove, adequacy of the fitted hierarchical distribution, complementing the conditional diagnostics.
+
+## Appendix D: Computational Environment and Methodological References
+
+### D.1 Software Environment & Key Package Versions
+Reproducibility was ensured by tracking key package versions utilized in model estimation, diagnostic validation, and performance evaluation:
+
+```{r session_packages, echo=FALSE}
+pkg_list <- c("lme4", "DHARMa", "caret", "pROC", "car", "ggplot2", "dplyr", "kableExtra", "knitr", "rmarkdown")
+pkg_versions <- sapply(pkg_list, function(p) as.character(packageVersion(p)))
+env_df <- data.frame(
+  Package = pkg_list,
+  Version = as.character(pkg_versions),
+  Role = c(
+    "Linear and generalized mixed-effects model estimation via maximum likelihood (bobyqa)",
+    "Residual diagnostics and simulation envelopes for generalized linear mixed models",
+    "Data partitioning and stratified 5-fold cross-validation",
+    "ROC curve estimation, AUC computation, and DeLong confidence intervals",
+    "Generalized variance inflation factors (GVIF) for collinearity diagnostics",
+    "Data visualization and calibration curve generation",
+    "Data manipulation, pipeline filtering, and feature transformation",
+    "Publication-quality LaTeX table formatting and column specification",
+    "Dynamic report generation and code execution engine",
+    "Document conversion pipeline to PDF via pandoc and pdfLaTeX"
+  ),
+  stringsAsFactors = FALSE,
+  row.names = NULL
+)
+rownames(env_df) <- NULL
+
+kable(env_df, booktabs = TRUE, caption = "Key software packages and analytical environment") |>
+  kable_styling(latex_options = "hold_position", font_size = 7.5) |>
+  column_spec(1, width = "2.2cm") |>
+  column_spec(2, width = "1.8cm") |>
+  column_spec(3, width = "10.0cm")
+```
+
+The underlying analysis was executed in R version `r getRversion()` on Linux x86_64 (`r R.version$platform`).
+
+### D.2 Methodological and Regulatory References
+1. **APRA Prudential Standard APS 220 (*Credit Risk Management*, effective 1 January 2022; superseding APS 220 *Credit Quality*):** Australian Prudential Regulation Authority (APRA), Sydney. Available at: https://www.apra.gov.au/credit-risk-management. Standards establishing minimum prudential requirements for credit risk governance, independent model validation, and continuous monitoring of credit portfolio performance.
+2. **Basel Committee on Banking Supervision (BCBS, 2015):** *Corporate Governance Principles for Banks* and *Guidance on Credit Risk and Accounting for Expected Credit Losses*. Bank for International Settlements (BIS), Basel. Available at: https://www.bis.org/bcbs/publ/d328.htm. International supervisory guidance on credit risk governance, model risk management, and sound credit underwriting.
+3. **Bates, D., Kliegl, R., Vasishth, S., & Baayen, H. (2015):** Parsimonious mixed models. *arXiv preprint arXiv:1506.04967*. Available at: https://arxiv.org/abs/1506.04967. Methodological foundations governing the diagnosis of singular fits, boundary variances, and parsimonious random effects selection in `lme4`.
+4. **Hartig, F. (2026):** *DHARMa: Residual Diagnostics for Hierarchical (Multi-Level / Mixed) Regression Models*. R package version 0.5.0. Available at: https://cran.r-project.org/package=DHARMa. DOI: 10.32614/CRAN.package.DHARMa. Comprehensive simulation-based quantile residual framework for generalized linear mixed models.
