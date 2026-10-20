@@ -1,6 +1,4 @@
-# ==============================================================================
-# Utility Functions for Credit Risk Modelling (MXN600 Assignment 2)
-# ==============================================================================
+# Utility Functions
 
 suppressPackageStartupMessages({
   library(pROC)
